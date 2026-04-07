@@ -37,7 +37,11 @@
         }
         button:hover { background-color: #e64000; }
         
-        /* New Styles for our extra features */
+        .flex-row { display: flex; gap: 10px; }
+        .secondary-btn { background-color: #6c757d; }
+        .secondary-btn:hover { background-color: #5a6268; }
+
+        /* Updated Styles for Drag and Drop */
         .exercise-item {
             background: #eee;
             padding: 10px;
@@ -47,7 +51,17 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            cursor: grab; /* Shows a hand cursor so users know they can grab it */
+            transition: background 0.2s;
         }
+        .exercise-item:active {
+            cursor: grabbing; /* Closes the hand when clicked */
+        }
+        .exercise-item.drag-over {
+            border-top: 3px solid #FF4700; /* Shows an orange line where the item will drop */
+            background: #e2e2e2;
+        }
+        
         .small-btn {
             width: auto;
             padding: 5px 8px;
@@ -57,9 +71,17 @@
         }
         .delete-btn { background-color: #dc3545; }
         .delete-btn:hover { background-color: #c82333; }
-        .flex-row { display: flex; gap: 10px; }
-        .secondary-btn { background-color: #6c757d; }
-        .secondary-btn:hover { background-color: #5a6268; }
+        
+        /* A tiny grab handle icon indicator */
+        .grab-handle {
+            color: #999;
+            margin-right: 10px;
+            font-size: 18px;
+            user-select: none;
+        }
+        .exercise-info {
+            flex-grow: 1; /* Pushes buttons to the right */
+        }
     </style>
 </head>
 <body>
@@ -92,6 +114,7 @@
 
     <div class="card">
         <h3>Your Routine:</h3>
+        <p style="font-size: 11px; color: gray; margin-top: 0;">Drag and drop items to reorder them.</p>
         <div id="routineList">
             <p id="emptyMessage" style="color: gray; font-size: 12px;">No exercises added yet.</p>
         </div>
@@ -109,9 +132,9 @@
         ];
 
         let myRoutine = [];
-        let editingIndex = -1; // -1 means we are adding new, not editing
+        let editingIndex = -1;
+        let draggedIndex = null; // Keeps track of what we are currently dragging
 
-        // Populate dropdown on load
         window.onload = function() {
             const dropdown = document.getElementById("exerciseSelect");
             for (let i = 0; i < exerciseDatabase.length; i++) {
@@ -122,10 +145,9 @@
             }
         };
 
-        // Redraw the entire routine list based on the array
         function renderRoutine() {
             const listDiv = document.getElementById("routineList");
-            listDiv.innerHTML = ""; // Clear current list
+            listDiv.innerHTML = ""; 
 
             if (myRoutine.length === 0) {
                 listDiv.innerHTML = '<p id="emptyMessage" style="color: gray; font-size: 12px;">No exercises added yet.</p>';
@@ -133,15 +155,22 @@
             }
 
             for (let i = 0; i < myRoutine.length; i++) {
-                let ex = myRoutine[i]; // ex is our array: [Name, Sets, Reps, Weight]
+                let ex = myRoutine[i]; 
                 let div = document.createElement("div");
                 div.className = "exercise-item";
                 
-                // Text for the exercise
-                let info = document.createElement("div");
-                info.innerHTML = `<strong>${ex[0]}</strong><br>${ex[1]}s x ${ex[2]}r @ ${ex[3]}kg`;
+                // Make the div draggable and attach drag events
+                div.setAttribute("draggable", "true");
+                div.setAttribute("ondragstart", `dragStart(event, ${i})`);
+                div.setAttribute("ondragover", `dragOver(event, this)`);
+                div.setAttribute("ondragleave", `dragLeave(event, this)`);
+                div.setAttribute("ondrop", `drop(event, ${i}, this)`);
                 
-                // Buttons container
+                let info = document.createElement("div");
+                info.className = "exercise-info";
+                // Added a '≡' symbol as a visual cue for dragging
+                info.innerHTML = `<span class="grab-handle">≡</span><strong>${ex[0]}</strong><br><span style="margin-left: 28px;">${ex[1]}s x ${ex[2]}r @ ${ex[3]}kg</span>`;
+                
                 let btnGroup = document.createElement("div");
                 btnGroup.innerHTML = `
                     <button class="small-btn secondary-btn" onclick="editExercise(${i})">Edit</button>
@@ -153,6 +182,48 @@
                 listDiv.appendChild(div);
             }
         }
+
+        // --- DRAG AND DROP FUNCTIONS ---
+        
+        function dragStart(event, index) {
+            draggedIndex = index;
+            // Required for Firefox
+            event.dataTransfer.setData('text/plain', index);
+            event.dataTransfer.effectAllowed = 'move';
+        }
+
+        function dragOver(event, element) {
+            // Prevent default to allow dropping
+            event.preventDefault(); 
+            event.dataTransfer.dropEffect = 'move';
+            // Add the orange line class to show where it will land
+            element.classList.add('drag-over'); 
+        }
+
+        function dragLeave(event, element) {
+            // Remove the orange line when dragging away
+            element.classList.remove('drag-over');
+        }
+
+        function drop(event, targetIndex, element) {
+            event.preventDefault();
+            element.classList.remove('drag-over');
+
+            // If we dropped it in the same spot, do nothing
+            if (draggedIndex === null || draggedIndex === targetIndex) return;
+
+            // 1. Remove the item from its old position
+            const draggedItem = myRoutine.splice(draggedIndex, 1)[0];
+            
+            // 2. Insert the item into its new position
+            myRoutine.splice(targetIndex, 0, draggedItem);
+            
+            // 3. Redraw the screen to show the new order
+            renderRoutine();
+            draggedIndex = null;
+        }
+
+        // -------------------------------
 
         function addExercise() {
             const name = document.getElementById("exerciseSelect").value;
@@ -168,64 +239,54 @@
             const newExercise = [name, parseInt(sets), parseInt(reps), parseInt(weight)];
 
             if (editingIndex === -1) {
-                // Adding a new exercise
                 myRoutine.push(newExercise);
             } else {
-                // Updating an existing exercise
                 myRoutine[editingIndex] = newExercise;
-                editingIndex = -1; // Reset back to add mode
+                editingIndex = -1; 
                 document.getElementById("formTitle").innerText = "Add Exercise";
                 document.getElementById("addUpdateBtn").innerText = "+ Add to Routine";
             }
 
-            renderRoutine(); // Redraw screen
+            renderRoutine(); 
 
-            // Clear inputs
             document.getElementById("targetSets").value = "";
             document.getElementById("targetReps").value = "";
             document.getElementById("targetWeight").value = "";
         }
 
         function deleteExercise(index) {
-            myRoutine.splice(index, 1); // Remove 1 item at the given index
+            myRoutine.splice(index, 1); 
             renderRoutine();
         }
 
         function editExercise(index) {
             let ex = myRoutine[index];
             
-            // Populate inputs with current data
             document.getElementById("exerciseSelect").value = ex[0];
             document.getElementById("targetSets").value = ex[1];
             document.getElementById("targetReps").value = ex[2];
             document.getElementById("targetWeight").value = ex[3];
 
-            // Change form to Edit Mode
             editingIndex = index;
             document.getElementById("formTitle").innerText = "Edit Exercise";
             document.getElementById("addUpdateBtn").innerText = "Update Exercise";
             
-            // Scroll to top so user sees the edit form
             window.scrollTo(0, 0);
         }
 
-        // --- NEW FEATURE: EXPORT ---
         function exportJSON() {
             const routineName = document.getElementById("routineName").value || "My_Routine";
             const finalData = { n: routineName, e: myRoutine };
             
-            // Create a downloadable file in the browser
             const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(finalData));
             const downloadAnchorNode = document.createElement('a');
             downloadAnchorNode.setAttribute("href", dataStr);
-            // Replace spaces with underscores for the file name
             downloadAnchorNode.setAttribute("download", routineName.replace(/\s+/g, '_') + ".json");
             document.body.appendChild(downloadAnchorNode);
             downloadAnchorNode.click();
             downloadAnchorNode.remove();
         }
 
-        // --- NEW FEATURE: IMPORT ---
         function importJSON(event) {
             const file = event.target.files[0];
             if (!file) return;
@@ -235,7 +296,6 @@
                 try {
                     const importedData = JSON.parse(e.target.result);
                     
-                    // Validate that it's our specific format (has 'n' and 'e')
                     if (importedData.n !== undefined && Array.isArray(importedData.e)) {
                         document.getElementById("routineName").value = importedData.n;
                         myRoutine = importedData.e;
@@ -247,7 +307,6 @@
                 } catch (err) {
                     alert("Error reading file. Is it a valid JSON?");
                 }
-                // Reset file input so you can import the same file again if needed
                 event.target.value = ''; 
             };
             reader.readAsText(file);
