@@ -10,7 +10,7 @@
             font-family: Arial, sans-serif;
             background-color: #f4f4f9;
             padding: 20px;
-            max-width: 400px; /* Perfect for phone screens */
+            max-width: 400px;
             margin: 0 auto;
         }
         .card {
@@ -24,27 +24,42 @@
             width: 100%;
             padding: 10px;
             margin-bottom: 10px;
-            box-sizing: border-box; /* Ensures padding doesn't break width */
+            box-sizing: border-box;
             border: 1px solid #ccc;
             border-radius: 4px;
         }
         button {
-            background-color: #FF4700; /* Pebble Orange! */
+            background-color: #FF4700;
             color: white;
             font-weight: bold;
             border: none;
             cursor: pointer;
         }
-        button:hover {
-            background-color: #e64000;
-        }
+        button:hover { background-color: #e64000; }
+        
+        /* New Styles for our extra features */
         .exercise-item {
             background: #eee;
             padding: 10px;
             margin-bottom: 5px;
             border-radius: 4px;
             font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
+        .small-btn {
+            width: auto;
+            padding: 5px 8px;
+            margin: 0 0 0 5px;
+            font-size: 12px;
+            display: inline-block;
+        }
+        .delete-btn { background-color: #dc3545; }
+        .delete-btn:hover { background-color: #c82333; }
+        .flex-row { display: flex; gap: 10px; }
+        .secondary-btn { background-color: #6c757d; }
+        .secondary-btn:hover { background-color: #5a6268; }
     </style>
 </head>
 <body>
@@ -52,20 +67,27 @@
     <h2>Gym Routine Setup</h2>
 
     <div class="card">
+        <h3>Manage Files</h3>
+        <div class="flex-row">
+            <button class="secondary-btn" onclick="document.getElementById('importFile').click()">Load Routine</button>
+            <button class="secondary-btn" onclick="exportJSON()">Save to File</button>
+        </div>
+        <input type="file" id="importFile" accept=".json" style="display: none;" onchange="importJSON(event)">
+    </div>
+
+    <div class="card">
         <label>Routine Name:</label>
         <input type="text" id="routineName" placeholder="e.g., Push Day, Leg Day">
     </div>
 
     <div class="card">
-        <h3>Add Exercise</h3>
-        <select id="exerciseSelect">
-            </select>
-        
+        <h3 id="formTitle">Add Exercise</h3>
+        <select id="exerciseSelect"></select>
         <input type="number" id="targetSets" placeholder="Target Sets (e.g., 3)">
         <input type="number" id="targetReps" placeholder="Target Reps (e.g., 10)">
         <input type="number" id="targetWeight" placeholder="Target Weight in kg (e.g., 60)">
         
-        <button onclick="addExercise()">+ Add to Routine</button>
+        <button id="addUpdateBtn" onclick="addExercise()">+ Add to Routine</button>
     </div>
 
     <div class="card">
@@ -87,7 +109,9 @@
         ];
 
         let myRoutine = [];
+        let editingIndex = -1; // -1 means we are adding new, not editing
 
+        // Populate dropdown on load
         window.onload = function() {
             const dropdown = document.getElementById("exerciseSelect");
             for (let i = 0; i < exerciseDatabase.length; i++) {
@@ -98,7 +122,39 @@
             }
         };
 
-function addExercise() {
+        // Redraw the entire routine list based on the array
+        function renderRoutine() {
+            const listDiv = document.getElementById("routineList");
+            listDiv.innerHTML = ""; // Clear current list
+
+            if (myRoutine.length === 0) {
+                listDiv.innerHTML = '<p id="emptyMessage" style="color: gray; font-size: 12px;">No exercises added yet.</p>';
+                return;
+            }
+
+            for (let i = 0; i < myRoutine.length; i++) {
+                let ex = myRoutine[i]; // ex is our array: [Name, Sets, Reps, Weight]
+                let div = document.createElement("div");
+                div.className = "exercise-item";
+                
+                // Text for the exercise
+                let info = document.createElement("div");
+                info.innerHTML = `<strong>${ex[0]}</strong><br>${ex[1]}s x ${ex[2]}r @ ${ex[3]}kg`;
+                
+                // Buttons container
+                let btnGroup = document.createElement("div");
+                btnGroup.innerHTML = `
+                    <button class="small-btn secondary-btn" onclick="editExercise(${i})">Edit</button>
+                    <button class="small-btn delete-btn" onclick="deleteExercise(${i})">X</button>
+                `;
+
+                div.appendChild(info);
+                div.appendChild(btnGroup);
+                listDiv.appendChild(div);
+            }
+        }
+
+        function addExercise() {
             const name = document.getElementById("exerciseSelect").value;
             const sets = document.getElementById("targetSets").value;
             const reps = document.getElementById("targetReps").value;
@@ -109,25 +165,94 @@ function addExercise() {
                 return;
             }
 
-            // SHRUNK DATA: We removed the labels and just made a simple array!
-            // Order is always: [Name, Sets, Reps, Weight]
             const newExercise = [name, parseInt(sets), parseInt(reps), parseInt(weight)];
-            
-            myRoutine.push(newExercise);
 
-            document.getElementById("emptyMessage").style.display = "none";
-            const listDiv = document.getElementById("routineList");
-            const exerciseDiv = document.createElement("div");
-            exerciseDiv.className = "exercise-item";
-            exerciseDiv.innerHTML = `<strong>${name}</strong>: ${sets} sets x ${reps} reps @ ${weight}kg`;
-            listDiv.appendChild(exerciseDiv);
+            if (editingIndex === -1) {
+                // Adding a new exercise
+                myRoutine.push(newExercise);
+            } else {
+                // Updating an existing exercise
+                myRoutine[editingIndex] = newExercise;
+                editingIndex = -1; // Reset back to add mode
+                document.getElementById("formTitle").innerText = "Add Exercise";
+                document.getElementById("addUpdateBtn").innerText = "+ Add to Routine";
+            }
 
+            renderRoutine(); // Redraw screen
+
+            // Clear inputs
             document.getElementById("targetSets").value = "";
             document.getElementById("targetReps").value = "";
             document.getElementById("targetWeight").value = "";
         }
 
-        // NEW HELPER FUNCTION: This looks for the CloudPebble return URL
+        function deleteExercise(index) {
+            myRoutine.splice(index, 1); // Remove 1 item at the given index
+            renderRoutine();
+        }
+
+        function editExercise(index) {
+            let ex = myRoutine[index];
+            
+            // Populate inputs with current data
+            document.getElementById("exerciseSelect").value = ex[0];
+            document.getElementById("targetSets").value = ex[1];
+            document.getElementById("targetReps").value = ex[2];
+            document.getElementById("targetWeight").value = ex[3];
+
+            // Change form to Edit Mode
+            editingIndex = index;
+            document.getElementById("formTitle").innerText = "Edit Exercise";
+            document.getElementById("addUpdateBtn").innerText = "Update Exercise";
+            
+            // Scroll to top so user sees the edit form
+            window.scrollTo(0, 0);
+        }
+
+        // --- NEW FEATURE: EXPORT ---
+        function exportJSON() {
+            const routineName = document.getElementById("routineName").value || "My_Routine";
+            const finalData = { n: routineName, e: myRoutine };
+            
+            // Create a downloadable file in the browser
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(finalData));
+            const downloadAnchorNode = document.createElement('a');
+            downloadAnchorNode.setAttribute("href", dataStr);
+            // Replace spaces with underscores for the file name
+            downloadAnchorNode.setAttribute("download", routineName.replace(/\s+/g, '_') + ".json");
+            document.body.appendChild(downloadAnchorNode);
+            downloadAnchorNode.click();
+            downloadAnchorNode.remove();
+        }
+
+        // --- NEW FEATURE: IMPORT ---
+        function importJSON(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const importedData = JSON.parse(e.target.result);
+                    
+                    // Validate that it's our specific format (has 'n' and 'e')
+                    if (importedData.n !== undefined && Array.isArray(importedData.e)) {
+                        document.getElementById("routineName").value = importedData.n;
+                        myRoutine = importedData.e;
+                        renderRoutine();
+                        alert("Routine loaded successfully!");
+                    } else {
+                        alert("Invalid file format. Ensure it was created by this app.");
+                    }
+                } catch (err) {
+                    alert("Error reading file. Is it a valid JSON?");
+                }
+                // Reset file input so you can import the same file again if needed
+                event.target.value = ''; 
+            };
+            reader.readAsText(file);
+        }
+
         function getQueryParam(variable, defaultValue) {
             var query = location.search.substring(1);
             var vars = query.split('&');
@@ -147,16 +272,8 @@ function addExercise() {
                 return;
             }
 
-            // SHRUNK DATA: "n" is Name, "e" is Exercises
-            const finalData = { 
-                n: routineName, 
-                e: myRoutine 
-            };
-            
+            const finalData = { n: routineName, e: myRoutine };
             const jsonString = JSON.stringify(finalData);
-
-            // You can uncomment this alert to see how tiny the JSON is now!
-            // alert("Sending Shrunk JSON:\n" + jsonString + "\n\nLength: " + jsonString.length + " characters");
 
             var returnTo = getQueryParam('return_to', 'pebblejs://close#');
             window.location.href = returnTo + encodeURIComponent(jsonString);
