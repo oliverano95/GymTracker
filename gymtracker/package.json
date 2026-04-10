@@ -5,6 +5,7 @@
     "name": "gymtracker",
     "pebble": {
         "capabilities": [
+            "configurable",
             "health"
         ],
         "displayName": "GymTracker",
@@ -33,18 +34,12 @@
         },
         "sdkVersion": "3",
         "targetPlatforms": [
-            "aplite",
-            "basalt",
-            "chalk",
-            "diorite",
-            "emery",
-            "gabbro",
-            "flint"
+            "emery"
         ],
         "uuid": "039ac8f0-f9a6-4c1f-88ca-1217c9296134",
         "watchapp": {
             "watchface": false
         }
     },
-    "version": "1.0.0"
+    "version": "1.2.0"
 }
