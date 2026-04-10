@@ -29,6 +29,9 @@
         
         .history-item { font-size: 12px; padding: 8px; border-bottom: 1px solid #eee; }
         .history-item:last-child { border-bottom: none; }
+
+        /* Styles for the new search bar */
+        #exerciseSearch { border: 2px solid #FF4700; background-color: #fffaf5; }
     </style>
 </head>
 <body>
@@ -65,7 +68,11 @@
 
     <div class="card">
         <h3 id="formTitle">Add Exercise</h3>
+        
+        <input type="text" id="exerciseSearch" placeholder="🔍 Search exercises..." onkeyup="filterExercises()">
+        
         <select id="exerciseSelect"></select>
+        
         <input type="number" id="targetSets" placeholder="Target Sets (e.g., 3)">
         <input type="number" id="targetReps" placeholder="Target Reps (e.g., 10)">
         <input type="number" id="targetWeight" placeholder="Target Weight in kg (e.g., 60)">
@@ -92,13 +99,33 @@
     <button onclick="saveAndSend()" style="padding: 15px; font-size: 18px;">Save & Send to Pebble</button>
 
     <script>
-        const exerciseDatabase = [
-            "Bench Press", "Squat", "Deadlift", "Overhead Press", 
-            "Pull Ups", "Barbell Row", "Bicep Curls", "Tricep Extensions", 
-            "Dumbbell Flies", "French Press", "Target Abs", "Leg Raise", 
-            "Chest Pull", "Facepull", "Hammer Curl", "Cable Crunch", "Pallof Press", 
-            "Leg Press", "Leg Extension", "Leg Curl", "Calf"
-        ];
+        // 1. The Categorized Database
+        const exerciseDatabase = {
+            "Chest": [
+                "Bench Press", "Incline Bench Press", "Decline Bench Press", 
+                "Dumbbell Flyes", "Cable Crossovers", "Push-Ups", "Pec Deck", "Chest Dips"
+            ],
+            "Back": [
+                "Deadlift", "Pull-Ups", "Chin-Ups", "Barbell Row", "Dumbbell Row", 
+                "Lat Pulldown", "Seated Cable Row", "T-Bar Row", "Back Extensions", "Facepulls"
+            ],
+            "Shoulders": [
+                "Overhead Press", "Arnold Press", "Lateral Raises", "Front Raises", 
+                "Upright Rows", "Reverse Pec Deck", "Shrugs", "Push Press"
+            ],
+            "Arms": [
+                "Bicep Curls", "Hammer Curls", "Preacher Curls", "Concentration Curls",
+                "Tricep Extensions", "Skull Crushers", "Tricep Pushdowns", "Tricep Dips"
+            ],
+            "Legs": [
+                "Squats", "Leg Press", "Lunges", "Leg Extensions", "Leg Curls", 
+                "Calf Raises", "Romanian Deadlifts", "Bulgarian Split Squats", "Hack Squat"
+            ],
+            "Abdominals": [
+                "Crunches", "Leg Raises", "Planks", "Cable Crunch", "Russian Twists", 
+                "Ab Wheel Rollouts", "Hanging Leg Raises", "Pallof Press", "Target Abs"
+            ]
+        };
 
         let myRoutine = [];
         let editingIndex = -1;
@@ -117,27 +144,56 @@
             return defaultValue || false;
         }
 
-        window.onload = function() {
-            // 1. Populate Exercise Dropdown
+        // --- DROPDOWN & SEARCH LOGIC ---
+        function renderExerciseDropdown(filterText = "") {
             const dropdown = document.getElementById("exerciseSelect");
-            for (let i = 0; i < exerciseDatabase.length; i++) {
-                let newOption = document.createElement("option");
-                newOption.value = exerciseDatabase[i];
-                newOption.text = exerciseDatabase[i];
-                dropdown.appendChild(newOption);
-            }
+            dropdown.innerHTML = ""; 
+            const lowerFilter = filterText.toLowerCase();
 
-            // 2. Load Google Settings passed from Pebble app
+            for (const [group, exercises] of Object.entries(exerciseDatabase)) {
+                const filteredExercises = exercises.filter(ex => ex.toLowerCase().includes(lowerFilter));
+
+                if (filteredExercises.length > 0) {
+                    const optgroup = document.createElement("optgroup");
+                    optgroup.label = "── " + group.toUpperCase() + " ──";
+
+                    filteredExercises.forEach(ex => {
+                        const option = document.createElement("option");
+                        option.value = ex;
+                        option.text = ex;
+                        optgroup.appendChild(option);
+                    });
+
+                    dropdown.appendChild(optgroup);
+                }
+            }
+            
+            if (dropdown.options.length === 0) {
+                const option = document.createElement("option");
+                option.text = "No exercises found...";
+                option.disabled = true;
+                dropdown.appendChild(option);
+            }
+        }
+
+        function filterExercises() {
+            const searchTerm = document.getElementById("exerciseSearch").value;
+            renderExerciseDropdown(searchTerm);
+        }
+
+        window.onload = function() {
+            // Load categorized dropdown
+            renderExerciseDropdown();
+
+            // Load Google Settings
             const storedUrl = getQueryParam('googleUrl', '');
             const storedPwd = getQueryParam('googlePwd', '');
             if (storedUrl) document.getElementById("googleUrlInput").value = storedUrl;
             if (storedPwd) document.getElementById("googlePwdInput").value = storedPwd;
 
-            // 3. Load & Render Workout History passed from Pebble app
+            // Load History
             const historyStr = getQueryParam('history', '[]');
-            try {
-                workoutHistory = JSON.parse(historyStr);
-            } catch(e) { workoutHistory = []; }
+            try { workoutHistory = JSON.parse(historyStr); } catch(e) { workoutHistory = []; }
             renderHistory();
         };
 
@@ -150,10 +206,8 @@
             }
             
             list.innerHTML = '';
-            // Display newest first
             [...workoutHistory].reverse().forEach(entry => {
                 const date = new Date(entry.timestamp).toLocaleString();
-                // Data format: RoutineName|YYYY-MM-DD|Duration|Ex1...
                 const parts = entry.data.split('|');
                 const name = parts[0] || "Unknown Routine";
                 const mins = Math.floor(parseInt(parts[2] || 0) / 60);
@@ -168,10 +222,8 @@
                 return;
             }
             
-            // Start the CSV string (removed the '#' symbol from Set!)
             let csvContent = "Date,Routine,Duration (s),Exercise,Set,Reps,Weight\n";
             
-            // Loop through every saved workout
             workoutHistory.forEach(entry => {
                 const rawString = entry.data;
                 const parts = rawString.split('|');
@@ -183,7 +235,6 @@
                 let currentExercise = "";
                 let setNum = 1;
                 
-                // Parse the exercises and sets
                 for (let i = 3; i < parts.length; i++) {
                     if (isNaN(parts[i])) {
                         currentExercise = parts[i];
@@ -200,7 +251,7 @@
                 }
             });
             
-            // THE FIX: Use a Blob to safely generate the file download!
+            // Generate safe Blob for download
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement("a");
             const url = URL.createObjectURL(blob);
@@ -221,7 +272,6 @@
                 renderHistory();
             }
         }
-
 
         // --- ROUTINE BUILDER FUNCTIONS ---
         function renderRoutine() {
@@ -292,6 +342,8 @@
                 document.getElementById("addUpdateBtn").innerText = "+ Add to Routine";
             }
             renderRoutine(); 
+            
+            // Clear inputs, but leave the search bar alone so they can add another chest exercise quickly!
             document.getElementById("targetSets").value = "";
             document.getElementById("targetReps").value = "";
             document.getElementById("targetWeight").value = "";
@@ -301,6 +353,11 @@
 
         function editExercise(index) {
             let ex = myRoutine[index];
+            
+            // Clear the search bar so the full list is available to select the existing exercise
+            document.getElementById("exerciseSearch").value = "";
+            renderExerciseDropdown();
+            
             document.getElementById("exerciseSelect").value = ex[0];
             document.getElementById("targetSets").value = ex[1];
             document.getElementById("targetReps").value = ex[2];
@@ -346,8 +403,6 @@
         function saveAndSend() {
             const routineName = document.getElementById("routineName").value || "My Routine";
             if (myRoutine.length === 0 && !shouldClearHistory) {
-                // Allow saving if they just want to update settings/clear history, 
-                // but warn if they are trying to send an empty routine
                 if(!document.getElementById("googleUrlInput").value && !document.getElementById("googlePwdInput").value){
                   alert("Please add at least one exercise or configure settings.");
                   return;
@@ -366,7 +421,6 @@
             const googleUrl = document.getElementById("googleUrlInput").value;
             const googlePwd = document.getElementById("googlePwdInput").value;
 
-            // Package the data for PebbleKit JS
             const configData = {
                 routineData: delimitedString,
                 googleUrl: googleUrl,
