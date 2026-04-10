@@ -28,7 +28,7 @@ Please feel free to open an Issue, submit a Pull Request, or reach out with any 
 ### 2. Working Out (Watch)
 Leave your phone in your locker! All controls are designed to be used without looking, using the Pebble's physical buttons:
 * **Up / Down Buttons:** Adjust the actual reps or weight you lifted.
-* **Short-Press Select:** Toggle between editing your Reps (Orange) and your Weight (Blue).
+* **Short-Press Select:** Toggle between editing your Reps and your Weight.
 * **Long-Press Select (500ms):** Log the set! The watch will give a double-vibration and start your automatic Rest Timer.
 * **Skip Rest:** If you are ready to lift before the timer finishes, just short-press Select to skip the rest period.
 
