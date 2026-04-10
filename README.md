@@ -1,3 +1,5 @@
+![GymTracker_OnPT2](https://github.com/user-attachments/assets/fbe0bffa-2d7b-4158-b36e-307a761a8b5a)
+
 # GymTracker - Smart Gym Tracker for Pebble
 
 A fully-featured, standalone workout tracker for Pebble smartwatches with smart rest timers, haptic coaching, and automatic Google Sheets export. 
