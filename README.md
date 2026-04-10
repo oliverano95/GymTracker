@@ -2,7 +2,7 @@
 
 A fully-featured, standalone workout tracker for Pebble smartwatches with smart rest timers, haptic coaching, and automatic Google Sheets export. 
 
-You can install the app directly from the Rebble App Store here: https://apps.repebble.com/0664a987078943a28f196064
+You can install the app directly from the App Store here: https://apps.repebble.com/0664a987078943a28f196064
 
 You can configure your routines using the companion website here: https://oliverano95.github.io/solid-lamp/
 
