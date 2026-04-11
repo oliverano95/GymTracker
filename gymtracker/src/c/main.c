@@ -33,6 +33,7 @@ static int s_ex_vibe = 3;
 static int s_rest_vibe = 2;  
 static int s_theme_color_idx = 0; 
 static int s_weight_unit_idx = 0; 
+static int s_long_press_ms = 500; 
 
 // --- WORKOUT TRACKING ---
 static int s_curr_ex_idx = 0;
@@ -98,6 +99,7 @@ static void load_settings() {
   if(persist_exists(SETTINGS_KEY_BASE + 4)) s_rest_vibe = persist_read_int(SETTINGS_KEY_BASE + 4);
   if(persist_exists(SETTINGS_KEY_BASE + 5)) s_theme_color_idx = persist_read_int(SETTINGS_KEY_BASE + 5);
   if(persist_exists(SETTINGS_KEY_BASE + 6)) s_weight_unit_idx = persist_read_int(SETTINGS_KEY_BASE + 6);
+  if(persist_exists(SETTINGS_KEY_BASE + 7)) s_long_press_ms = persist_read_int(SETTINGS_KEY_BASE + 7);
 }
 
 static void save_setting(int key_offset, int value) {
@@ -172,7 +174,7 @@ static void refresh_directory() {
 
 
 // --- SETTINGS WINDOW LOGIC ---
-static uint16_t settings_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) { return 7; }
+static uint16_t settings_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) { return 8; }
 
 static void settings_draw_row_callback(GContext* ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
   int i = cell_index->row;
@@ -189,6 +191,7 @@ static void settings_draw_row_callback(GContext* ctx, const Layer *cell_layer, M
     case 4: snprintf(title, sizeof(title), "Rest Vibe"); snprintf(subtitle, sizeof(subtitle), "%s", vibes[s_rest_vibe]); break;
     case 5: snprintf(title, sizeof(title), "Theme Color"); snprintf(subtitle, sizeof(subtitle), "%s", themes[s_theme_color_idx]); break;
     case 6: snprintf(title, sizeof(title), "Weight Unit"); snprintf(subtitle, sizeof(subtitle), "%s", units[s_weight_unit_idx]); break;
+    case 7: snprintf(title, sizeof(title), "Long Press"); snprintf(subtitle, sizeof(subtitle), "%d ms", s_long_press_ms); break; // NEW
   }
   menu_cell_basic_draw(ctx, cell_layer, title, subtitle, NULL);
 }
@@ -203,6 +206,7 @@ static void settings_select_callback(MenuLayer *menu_layer, MenuIndex *cell_inde
     case 5: s_theme_color_idx++; if(s_theme_color_idx > 3) s_theme_color_idx = 0; save_setting(5, s_theme_color_idx); 
             menu_layer_set_highlight_colors(s_settings_menu_layer, get_theme_color(), GColorWhite); break;
     case 6: s_weight_unit_idx++; if(s_weight_unit_idx > 1) s_weight_unit_idx = 0; save_setting(6, s_weight_unit_idx); break;
+    case 7: s_long_press_ms += 250; if(s_long_press_ms > 1500) s_long_press_ms = 250; save_setting(7, s_long_press_ms); break; 
   }
   menu_layer_reload_data(s_settings_menu_layer);
 }
@@ -316,23 +320,33 @@ static void summary_click_provider(void *context) {
 }
 static void summary_bg_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
-  int y_boxes = (bounds.size.h > 180) ? 120 : 85;
+  bool is_tall = (bounds.size.h > 180);
+  
+  // Pushed the boxes up from 85 to 75, and made them slightly shorter for small screens
+  int y_boxes = is_tall ? 120 : 75;
+  int box_h = is_tall ? 50 : 46; 
   int mid = bounds.size.w / 2;
+  
   graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorIslamicGreen, GColorBlack));
-  graphics_fill_rect(ctx, GRect(10, y_boxes, mid - 15, 50), 8, GCornersAll);
+  graphics_fill_rect(ctx, GRect(10, y_boxes, mid - 15, box_h), 8, GCornersAll);
+  
   graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorDarkGray));
-  graphics_fill_rect(ctx, GRect(mid + 5, y_boxes, mid - 15, 50), 8, GCornersAll);
+  graphics_fill_rect(ctx, GRect(mid + 5, y_boxes, mid - 15, box_h), 8, GCornersAll);
 }
+
 static void summary_window_load(Window *window) {
   Layer *w_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(w_layer);
   bool is_tall = (bounds.size.h > 180);
   
-  int y_img = is_tall ? 50 : 35;
-  int y_boxes = is_tall ? 120 : 85;
-  int y_info = is_tall ? 190 : 145;
+  // --- DYNAMIC SUMMARY SPACING ---
+  int y_title = is_tall ? 5 : 0;
+  int y_img = is_tall ? 50 : 32;
+  int y_boxes = is_tall ? 120 : 75;
+  int box_text_y = y_boxes + (is_tall ? 5 : 3);
+  int y_info = is_tall ? 190 : 126; // Pulled way up from 145 so it fits on screen!
 
-  s_sum_title_layer = build_text_layer(GRect(0, 5, bounds.size.w, 40), FONT_KEY_GOTHIC_28_BOLD, GColorBlack, GTextAlignmentCenter, w_layer);
+  s_sum_title_layer = build_text_layer(GRect(0, y_title, bounds.size.w, 40), FONT_KEY_GOTHIC_28_BOLD, GColorBlack, GTextAlignmentCenter, w_layer);
 
   s_fireworks_bitmap = gbitmap_create_with_resource(RESOURCE_ID_IMAGE_FIREWORKS);
   if (s_fireworks_bitmap) {
@@ -347,8 +361,10 @@ static void summary_window_load(Window *window) {
   layer_set_update_proc(s_summary_bg_layer, summary_bg_update_proc);
   layer_add_child(w_layer, s_summary_bg_layer);
 
-  s_beat_layer = build_text_layer(GRect(10, y_boxes + 5, (bounds.size.w/2) - 15, 40), FONT_KEY_GOTHIC_18_BOLD, GColorWhite, GTextAlignmentCenter, w_layer);
-  s_missed_layer = build_text_layer(GRect((bounds.size.w/2) + 5, y_boxes + 5, (bounds.size.w/2) - 15, 40), FONT_KEY_GOTHIC_18_BOLD, GColorWhite, GTextAlignmentCenter, w_layer);
+  s_beat_layer = build_text_layer(GRect(10, box_text_y, (bounds.size.w/2) - 15, 40), FONT_KEY_GOTHIC_18_BOLD, GColorWhite, GTextAlignmentCenter, w_layer);
+  s_missed_layer = build_text_layer(GRect((bounds.size.w/2) + 5, box_text_y, (bounds.size.w/2) - 15, 40), FONT_KEY_GOTHIC_18_BOLD, GColorWhite, GTextAlignmentCenter, w_layer);
+  
+  // Bottom text is now safely planted at Y:126
   s_sum_info_layer = build_text_layer(GRect(0, y_info, bounds.size.w, 40), FONT_KEY_GOTHIC_14, GColorBlack, GTextAlignmentCenter, w_layer);
 
   tick_timer_service_unsubscribe();
@@ -481,10 +497,24 @@ static void rest_bg_update_proc(Layer *layer, GContext *ctx) {
 static void update_workout_ui() {
   Exercise *ex = &s_exercises[s_curr_ex_idx];
   
+  // NEW: Check screen size so we know which font limits to apply
+  Layer *w_layer = window_get_root_layer(s_workout_window);
+  GRect bounds = layer_get_bounds(w_layer);
+  bool is_tall = (bounds.size.h > 180); 
+  
   int name_len = strlen(ex->name);
-  if (name_len > 14) text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  else if (name_len > 10) text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-  else text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
+  
+  if (is_tall) {
+    // Emery / Time 2 (Allow massive fonts)
+    if (name_len > 14) text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+    else if (name_len > 10) text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+    else text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
+  } else {
+    // Pebble 2 / Standard (Limit to 24_BOLD max, shrink to 18_BOLD earlier)
+    if (name_len > 10) text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+    else text_layer_set_font(s_exercise_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+  }
+  
   text_layer_set_text(s_exercise_layer, ex->name);
 
   static char next_buf[64];
@@ -628,7 +658,7 @@ static void wo_click_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, wo_up_click);
   window_single_click_subscribe(BUTTON_ID_DOWN, wo_down_click);
   window_single_click_subscribe(BUTTON_ID_SELECT, wo_select_short_click);
-  window_long_click_subscribe(BUTTON_ID_SELECT, 500, wo_select_long_click, NULL); 
+  window_long_click_subscribe(BUTTON_ID_SELECT, s_long_press_ms, wo_select_long_click, NULL); 
 }
 
 static void workout_window_load(Window *window) {
@@ -636,14 +666,18 @@ static void workout_window_load(Window *window) {
   GRect bounds = layer_get_bounds(w_layer);
   bool is_tall = (bounds.size.h > 180); 
 
-  s_line1_y = is_tall ? 60 : 35; 
-  s_line2_y = is_tall ? 195 : 140;
-  int top_margin = is_tall ? 10 : 2;
+  // --- DYNAMIC SPACING (Perfected for Pebble 2) ---
+  // Pushed s_line1_y down to 48 to give the top block more breathing room
+  s_line1_y = is_tall ? 60 : 48; 
+  s_line2_y = is_tall ? 195 : 144;
+  int top_margin = is_tall ? 10 : 0;
   int half_w = bounds.size.w / 2;
-  int set_y  = s_line1_y + (is_tall ? 5 : 2);
-  s_labels_y = s_line1_y + (is_tall ? 40 : 32); 
-  s_actual_y = s_labels_y + (is_tall ? 20 : 18); 
-  s_target_y = s_actual_y + (is_tall ? 36 : 32); 
+  
+  int set_y  = s_line1_y + (is_tall ? 5 : 0);
+  // Increased from 20 to 22 to push the highlight box down and away from the "Set" text
+  s_labels_y = s_line1_y + (is_tall ? 40 : 24); 
+  s_actual_y = s_labels_y + (is_tall ? 20 : 14);
+  s_target_y = s_actual_y + (is_tall ? 36 : 30);
 
   s_progress_layer = layer_create(GRect(0, 0, bounds.size.w, 6));
   layer_set_update_proc(s_progress_layer, progress_update_proc);
@@ -653,23 +687,39 @@ static void workout_window_load(Window *window) {
   layer_set_update_proc(s_workout_bg_layer, workout_bg_update_proc);
   layer_add_child(w_layer, s_workout_bg_layer);
 
-  s_exercise_layer = build_text_layer(GRect(5, top_margin, bounds.size.w - 70, 32), FONT_KEY_GOTHIC_28_BOLD, PBL_IF_COLOR_ELSE(GColorCobaltBlue, GColorBlack), GTextAlignmentLeft, w_layer);
-  s_next_exercise_layer = build_text_layer(GRect(5, top_margin + 28, bounds.size.w - 10, 20), FONT_KEY_GOTHIC_14, GColorBlack, GTextAlignmentLeft, w_layer);
-  s_clock_layer = build_text_layer(GRect(bounds.size.w - 65, top_margin - 4, 60, 20), FONT_KEY_GOTHIC_18_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
-  s_timer_layer = build_text_layer(GRect(bounds.size.w - 55, top_margin + 16, 55, 32), FONT_KEY_GOTHIC_24_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
+  // --- ADAPTIVE TEXT LAYERS ---
+  if (is_tall) {
+    // ⌚ EMERY / PEBBLE TIME 2
+    s_exercise_layer = build_text_layer(GRect(5, top_margin, bounds.size.w - 70, 32), FONT_KEY_GOTHIC_28_BOLD, PBL_IF_COLOR_ELSE(GColorCobaltBlue, GColorBlack), GTextAlignmentLeft, w_layer);
+    s_next_exercise_layer = build_text_layer(GRect(5, top_margin + 28, bounds.size.w - 10, 20), FONT_KEY_GOTHIC_14, GColorBlack, GTextAlignmentLeft, w_layer);
+    
+    // Timer moves up slightly to fill the space where the clock used to be
+    s_timer_layer = build_text_layer(GRect(bounds.size.w - 65, top_margin + 4, 60, 32), FONT_KEY_GOTHIC_24_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
+    
+    // HR aligns to the left, Clock aligns to the right at the bottom
+    s_hr_layer = build_text_layer(GRect(5, s_line2_y + 5, half_w, 24), FONT_KEY_GOTHIC_18_BOLD, PBL_IF_COLOR_ELSE(GColorRed, GColorBlack), GTextAlignmentLeft, w_layer);
+    s_clock_layer = build_text_layer(GRect(half_w, s_line2_y + 5, half_w - 5, 24), FONT_KEY_GOTHIC_18_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
+  } else {
+    // ⌚ PEBBLE 2 / STANDARD
+    // Dropped Y coordinate from -2 to 6 so the text clears the 6px progress bar entirely
+    s_timer_layer = build_text_layer(GRect(bounds.size.w - 55, 6, 55, 28), FONT_KEY_GOTHIC_24_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
+    s_exercise_layer = build_text_layer(GRect(2, 6, bounds.size.w - 55, 28), FONT_KEY_GOTHIC_24_BOLD, GColorBlack, GTextAlignmentLeft, w_layer);
+    
+    // "NEXT" drops slightly underneath to Y=28
+    s_next_exercise_layer = build_text_layer(GRect(2, 28, bounds.size.w - 4, 20), FONT_KEY_GOTHIC_14, GColorBlack, GTextAlignmentLeft, w_layer);
+    
+    s_hr_layer = build_text_layer(GRect(2, s_line2_y + 4, half_w + 10, 20), FONT_KEY_GOTHIC_14_BOLD, GColorBlack, GTextAlignmentLeft, w_layer);
+    s_clock_layer = build_text_layer(GRect(half_w, s_line2_y + 4, half_w - 2, 20), FONT_KEY_GOTHIC_14_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
+  }
 
-  s_set_layer = build_text_layer(GRect(0, set_y, bounds.size.w, 24), FONT_KEY_GOTHIC_24, GColorBlack, GTextAlignmentCenter, w_layer);
-  
+  // --- MIDDLE SECTION ---
+  s_set_layer = build_text_layer(GRect(0, set_y, bounds.size.w, 24), is_tall ? FONT_KEY_GOTHIC_24 : FONT_KEY_GOTHIC_18, GColorBlack, GTextAlignmentCenter, w_layer);
   s_label_reps_layer = build_text_layer(GRect(0, s_labels_y, half_w, 20), FONT_KEY_GOTHIC_14, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
   s_label_weight_layer = build_text_layer(GRect(half_w, s_labels_y, half_w, 20), FONT_KEY_GOTHIC_14, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
-  
   s_actual_reps_layer = build_text_layer(GRect(0, s_actual_y, half_w, 40), FONT_KEY_BITHAM_30_BLACK, GColorBlack, GTextAlignmentCenter, w_layer);
   s_actual_weight_layer = build_text_layer(GRect(half_w, s_actual_y, half_w, 40), FONT_KEY_BITHAM_30_BLACK, GColorBlack, GTextAlignmentCenter, w_layer);
-  
   s_target_reps_layer = build_text_layer(GRect(0, s_target_y, half_w, 20), FONT_KEY_GOTHIC_18, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
   s_target_weight_layer = build_text_layer(GRect(half_w, s_target_y, half_w, 20), FONT_KEY_GOTHIC_18, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
-
-  s_hr_layer = build_text_layer(GRect(0, s_line2_y + 5, bounds.size.w, 24), FONT_KEY_GOTHIC_18_BOLD, PBL_IF_COLOR_ELSE(GColorRed, GColorBlack), GTextAlignmentCenter, w_layer);
 
   // --- REST OVERLAY COMPONENT ---
   s_rest_overlay_layer = layer_create(GRect(0, s_line1_y, bounds.size.w, bounds.size.h - s_line1_y));
