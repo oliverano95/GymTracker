@@ -8,7 +8,7 @@ Pebble.addEventListener('ready', function(e) {
 // 2. Open the configuration web page when the user clicks "Settings"
 Pebble.addEventListener('showConfiguration', function(e) {
   // Your live GitHub Pages link
-  var myConfigUrl = 'https://oliverano95.github.io/solid-lamp/';
+  var myConfigUrl = 'https://oliverano95.github.io/GymTracker/';
   
   // Retrieve saved settings and workout history from the phone's local memory
   var googleUrl = localStorage.getItem('googleUrl') || '';

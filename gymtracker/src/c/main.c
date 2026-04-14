@@ -11,6 +11,7 @@ typedef struct {
   int target_sets;
   int target_reps;
   int target_weight;
+  int modifier;
   int current_set;
   int actual_reps[10];   
   int actual_weight[10];
@@ -34,6 +35,8 @@ static int s_rest_vibe = 2;
 static int s_theme_color_idx = 0; 
 static int s_weight_unit_idx = 0; 
 static int s_long_press_ms = 500; 
+static int s_drop_set_pct = 20; 
+static int s_super_rest_sec = 15;
 
 // --- WORKOUT TRACKING ---
 static int s_curr_ex_idx = 0;
@@ -45,11 +48,11 @@ static int s_temp_weight = 0;
 // --- GEOMETRY & CACHING ---
 static int s_line1_y, s_line2_y;
 static int s_labels_y, s_actual_y, s_target_y; 
-static int s_highlight_box_width = 0; // NEW: Caches the box width to save CPU!
+static int s_highlight_box_width = 0;
 
 // --- UI ELEMENTS ---
-static Window *s_main_window, *s_settings_window, *s_workout_window, *s_help_window, *s_confirm_window, *s_summary_window;
-static MenuLayer *s_menu_layer, *s_settings_menu_layer; 
+static Window *s_main_window, *s_settings_window, *s_workout_window, *s_help_window, *s_confirm_window, *s_summary_window, *s_variation_window;
+static MenuLayer *s_menu_layer, *s_settings_menu_layer, *s_variation_menu_layer; 
 static Layer *s_main_header_bg, *s_settings_header_bg, *s_progress_layer, *s_workout_bg_layer, *s_summary_bg_layer, *s_rest_overlay_layer;
 static TextLayer *s_main_header_text, *s_settings_header_text, *s_timer_layer, *s_clock_layer, *s_exercise_layer; 
 static TextLayer *s_next_exercise_layer, *s_set_layer, *s_label_reps_layer, *s_label_weight_layer, *s_target_reps_layer; 
@@ -59,12 +62,19 @@ static TextLayer *s_rest_title_layer, *s_rest_time_layer, *s_rest_skip_layer;
 static BitmapLayer *s_fireworks_layer;
 static GBitmap *s_fireworks_bitmap;
 
+static const char *s_variations[] = {
+  "None (Clear)", "(Seated)", "(Standing)", "(Dumbbell)", "(Barbell)", 
+  "(Cable)", "(Machine)", "(Single Arm)", "(Single Leg)"
+};
+#define NUM_VARIATIONS 9
+
 static int s_slot_to_edit = -1;
 static int s_target_swap_slot = -1; 
 static bool s_is_resting = false;
 static int s_rest_seconds_remaining = 0;
 
 // --- FORWARD DECLARATIONS FOR LAZY LOADING ---
+static void update_workout_ui();
 static void settings_window_load(Window *window);
 static void settings_window_unload(Window *window);
 static void help_window_load(Window *window);
@@ -96,14 +106,15 @@ static TextLayer* build_text_layer(GRect bounds, const char *font_key, GColor te
 }
 
 static GColor get_theme_color() {
-  // If the index is 4 or higher, the Easter Egg is active!
   if (s_theme_color_idx >= 4) {
-      uint8_t color_val = s_theme_color_idx - 4; // Gives us a 0-63 range
-      // Combines the opaque binary prefix with our 0-63 index
-      return PBL_IF_COLOR_ELSE((GColor){ .argb = 0b11000000 | color_val }, GColorBlack);
+    #if defined(PBL_COLOR)
+      uint8_t color_val = s_theme_color_idx - 4; 
+      return (GColor){ .argb = 0b11000000 | color_val };
+    #else
+      return GColorBlack;
+    #endif
   }
 
-  // Standard 4 colors
   if (s_theme_color_idx == 1) return PBL_IF_COLOR_ELSE(GColorCobaltBlue, GColorBlack);
   if (s_theme_color_idx == 2) return PBL_IF_COLOR_ELSE(GColorRed, GColorBlack);
   if (s_theme_color_idx == 3) return PBL_IF_COLOR_ELSE(GColorIslamicGreen, GColorBlack);
@@ -125,6 +136,8 @@ static void load_settings() {
   if(persist_exists(SETTINGS_KEY_BASE + 5)) s_theme_color_idx = persist_read_int(SETTINGS_KEY_BASE + 5);
   if(persist_exists(SETTINGS_KEY_BASE + 6)) s_weight_unit_idx = persist_read_int(SETTINGS_KEY_BASE + 6);
   if(persist_exists(SETTINGS_KEY_BASE + 7)) s_long_press_ms = persist_read_int(SETTINGS_KEY_BASE + 7);
+  if(persist_exists(SETTINGS_KEY_BASE + 8)) s_drop_set_pct = persist_read_int(SETTINGS_KEY_BASE + 8);
+  if(persist_exists(SETTINGS_KEY_BASE + 9)) s_super_rest_sec = persist_read_int(SETTINGS_KEY_BASE + 9);
 }
 
 static void save_setting(int key_offset, int value) {
@@ -145,14 +158,22 @@ static void parse_routine_string(const char *data) {
       if (token_count == 0) {
         snprintf(s_routine_name, sizeof(s_routine_name), "%s", temp);
       } else {
-        int ex_idx = (token_count - 1) / 4;
-        int field = (token_count - 1) % 4;
+        int ex_idx = (token_count - 1) / 5;
+        int field = (token_count - 1) % 5;
+        
         if (ex_idx < MAX_EXERCISES) {
           if (field == 0) snprintf(s_exercises[ex_idx].name, sizeof(s_exercises[ex_idx].name), "%s", temp);
           else if (field == 1) s_exercises[ex_idx].target_sets = atoi(temp);
           else if (field == 2) s_exercises[ex_idx].target_reps = atoi(temp);
-          else if (field == 3) {
-            s_exercises[ex_idx].target_weight = atoi(temp);
+          else if (field == 3) s_exercises[ex_idx].target_weight = atoi(temp);
+          else if (field == 4) {
+            s_exercises[ex_idx].modifier = atoi(temp);
+            
+            if (s_exercises[ex_idx].modifier == 1) {
+                s_exercises[ex_idx].target_sets *= 2;
+                if (s_exercises[ex_idx].target_sets > 10) s_exercises[ex_idx].target_sets = 10; 
+            }
+            
             s_exercises[ex_idx].current_set = 1;
             s_total_exercises = ex_idx + 1;
           }
@@ -175,9 +196,12 @@ static void parse_routine_string(const char *data) {
 
 static void refresh_directory() {
   s_active_slots = 0;
+  
+  // OPTIMIZATION: Moving large arrays to static to prevent Stack Overflows
+  static char temp_data[256]; 
+
   for(int i = 0; i < MAX_SLOTS; i++) {
     if(persist_exists(STORAGE_KEY_BASE + i)) {
-      char temp_data[256];
       persist_read_string(STORAGE_KEY_BASE + i, temp_data, sizeof(temp_data));
       
       if (i != s_active_slots) {
@@ -243,7 +267,7 @@ static void push_summary_window() {
 }
 
 // --- SETTINGS WINDOW LOGIC ---
-static uint16_t settings_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) { return 8; }
+static uint16_t settings_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) { return 10; }
 
 static void settings_draw_row_callback(GContext* ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
   int i = cell_index->row;
@@ -268,6 +292,8 @@ static void settings_draw_row_callback(GContext* ctx, const Layer *cell_layer, M
       break;
     case 6: snprintf(title, sizeof(title), "Weight Unit"); snprintf(subtitle, sizeof(subtitle), "%s", units[s_weight_unit_idx]); break;
     case 7: snprintf(title, sizeof(title), "Long Press"); snprintf(subtitle, sizeof(subtitle), "%d ms", s_long_press_ms); break; 
+    case 8: snprintf(title, sizeof(title), "Drop Set %%"); snprintf(subtitle, sizeof(subtitle), "-%d%%", s_drop_set_pct); break;
+    case 9: snprintf(title, sizeof(title), "Super Rest"); snprintf(subtitle, sizeof(subtitle), "%ds", s_super_rest_sec); break;
   }
   menu_cell_basic_draw(ctx, cell_layer, title, subtitle, NULL);
 }
@@ -281,14 +307,16 @@ static void settings_select_callback(MenuLayer *menu_layer, MenuIndex *cell_inde
     case 4: s_rest_vibe++; if(s_rest_vibe > 3) s_rest_vibe = 0; save_setting(4, s_rest_vibe); play_vibe(s_rest_vibe); break;
     case 5: 
       s_theme_color_idx++; 
-      if (s_theme_color_idx == 4) s_theme_color_idx = 0; // Wraps back to Orange in standard mode
-      else if (s_theme_color_idx > 67) s_theme_color_idx = 4; // Wraps 64-color loop in secret mode
+      if (s_theme_color_idx == 4) s_theme_color_idx = 0; 
+      else if (s_theme_color_idx > 67) s_theme_color_idx = 4; 
       
       save_setting(5, s_theme_color_idx); 
       menu_layer_set_highlight_colors(s_settings_menu_layer, get_theme_color(), GColorWhite); 
       break;
     case 6: s_weight_unit_idx++; if(s_weight_unit_idx > 1) s_weight_unit_idx = 0; save_setting(6, s_weight_unit_idx); break;
     case 7: s_long_press_ms += 250; if(s_long_press_ms > 1500) s_long_press_ms = 250; save_setting(7, s_long_press_ms); break; 
+    case 8: s_drop_set_pct += 5; if(s_drop_set_pct > 50) s_drop_set_pct = 10; save_setting(8, s_drop_set_pct); break;
+    case 9: s_super_rest_sec += 5; if(s_super_rest_sec > 30) s_super_rest_sec = 0; save_setting(9, s_super_rest_sec); break;
   }
   menu_layer_reload_data(s_settings_menu_layer);
 }
@@ -299,13 +327,12 @@ static void header_bg_update_proc(Layer *layer, GContext *ctx) {
 }
 
 static void settings_select_long_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
-  // Easter Egg Trigger!
   if (cell_index->row == 5) {
-    if (s_theme_color_idx < 4) s_theme_color_idx = 4; // Unlock! Jump into the 64-color range
-    else s_theme_color_idx = 0; // Lock! Return to standard Orange
+    if (s_theme_color_idx < 4) s_theme_color_idx = 4; 
+    else s_theme_color_idx = 0; 
     
     save_setting(5, s_theme_color_idx);
-    vibes_double_pulse(); // Haptic feedback so they know they found a secret
+    vibes_double_pulse(); 
     menu_layer_reload_data(s_settings_menu_layer);
     menu_layer_set_highlight_colors(s_settings_menu_layer, get_theme_color(), GColorWhite);
   }
@@ -327,7 +354,7 @@ static void settings_window_load(Window *window) {
     .get_num_rows = settings_get_num_rows_callback,
     .draw_row = settings_draw_row_callback,
     .select_click = settings_select_callback,
-    .select_long_click = settings_select_long_callback, // NEW: Binds your easter egg
+    .select_long_click = settings_select_long_callback, 
   });
   
   menu_layer_set_normal_colors(s_settings_menu_layer, GColorWhite, GColorBlack);
@@ -342,7 +369,6 @@ static void settings_window_unload(Window *window) {
   menu_layer_set_highlight_colors(s_menu_layer, get_theme_color(), GColorWhite);
 }
 
-
 // --- HELP WINDOW LOGIC ---
 static void help_window_load(Window *window) {
   Layer *w_layer = window_get_root_layer(window);
@@ -351,7 +377,6 @@ static void help_window_load(Window *window) {
   text_layer_set_text(s_help_text_layer, "Empty Slot\n\nOpen this app's settings on your phone to send a routine here.");
 }
 static void help_window_unload(Window *window) { text_layer_destroy(s_help_text_layer); }
-
 
 // --- EDIT / CONFIRM WINDOW LOGIC ---
 static void update_edit_ui() {
@@ -404,7 +429,6 @@ static void confirm_window_load(Window *window) {
   update_edit_ui(); 
 }
 static void confirm_window_unload(Window *window) { text_layer_destroy(s_confirm_text_layer); }
-
 
 // --- SUMMARY WINDOW LOGIC ---
 static void summary_exit_click(ClickRecognizerRef recognizer, void *context) { window_stack_pop(true); }
@@ -472,7 +496,12 @@ static void summary_window_load(Window *window) {
       int a_r = s_exercises[i].actual_reps[j];
       int a_w = s_exercises[i].actual_weight[j];
       int t_r = s_exercises[i].target_reps;
+      
       int t_w = s_exercises[i].target_weight;
+      if (s_exercises[i].modifier == 1 && ((j + 1) % 2 == 0)) {
+          t_w = (t_w * (100 - s_drop_set_pct)) / 100;
+      }
+      
       if (a_w > t_w || (a_w == t_w && a_r > t_r)) sets_above++;
       else if (a_w < t_w || (a_w == t_w && a_r < t_r)) sets_below++;
     }
@@ -489,14 +518,20 @@ static void summary_window_load(Window *window) {
   char date_buf[16];
   strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", tick_time);
 
-  char export_buf[512]; 
+  // OPTIMIZATION: Moving large arrays to static to prevent Stack Overflows
+  static char export_buf[512]; 
   int limit = sizeof(export_buf);
   int written = snprintf(export_buf, limit, "%s|%s|%d", s_routine_name, date_buf, s_workout_sec);
   int offset = (written < limit) ? written : limit - 1;
 
   for(int i = 0; i < s_total_exercises; i++) {
     if (offset >= limit - 1) break; 
-    written = snprintf(export_buf + offset, limit - offset, "|%s", s_exercises[i].name);
+    
+    const char *mod_label = "";
+    if (s_exercises[i].modifier == 1) mod_label = " [DROP]";
+    else if (s_exercises[i].modifier == 2) mod_label = " [SUPER]";
+    
+    written = snprintf(export_buf + offset, limit - offset, "|%s%s", s_exercises[i].name, mod_label);
     offset += (written < limit - offset) ? written : limit - offset - 1;
     
     for(int j = 0; j < s_exercises[i].target_sets; j++) {
@@ -505,8 +540,7 @@ static void summary_window_load(Window *window) {
       offset += (written < limit - offset) ? written : limit - offset - 1;
     }
   }
-
-  // OPTIMIZATION: Check for success before sending! Prevents silent Bluetooth crashes.
+  
   DictionaryIterator *iter;
   if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
       dict_write_cstring(iter, MESSAGE_KEY_WORKOUT_SUMMARY, export_buf);
@@ -516,6 +550,7 @@ static void summary_window_load(Window *window) {
       text_layer_set_text(s_sum_info_layer, "Sync Failed.\nCheck Bluetooth connection.");
   }
 }
+
 static void summary_window_unload(Window *window) {
   text_layer_destroy(s_sum_title_layer);
   layer_destroy(s_summary_bg_layer);
@@ -528,6 +563,74 @@ static void summary_window_unload(Window *window) {
   }
 }
 
+// --- VARIATION WINDOW LOGIC ---
+static uint16_t variation_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
+  return NUM_VARIATIONS;
+}
+
+static void variation_draw_row_callback(GContext* ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
+  menu_cell_basic_draw(ctx, cell_layer, s_variations[cell_index->row], NULL, NULL);
+}
+
+static void variation_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
+  Exercise *ex = &s_exercises[s_curr_ex_idx];
+  const char *var_str = s_variations[cell_index->row];
+  
+  char base_name[32];
+  strncpy(base_name, ex->name, sizeof(base_name));
+  base_name[sizeof(base_name) - 1] = '\0';
+  
+  for (int i = 1; i < NUM_VARIATIONS; i++) { 
+    char *match = strstr(base_name, s_variations[i]);
+    
+    if (match && match == base_name + strlen(base_name) - strlen(s_variations[i])) {
+      if (match > base_name && *(match - 1) == ' ') *(match - 1) = '\0';
+      else *match = '\0';
+      break; 
+    }
+  }
+  
+  if (cell_index->row == 0) {
+    strncpy(ex->name, base_name, sizeof(ex->name) - 1);
+  } else {
+    char temp[32];
+    snprintf(temp, sizeof(temp), "%s %s", base_name, var_str);
+    strncpy(ex->name, temp, sizeof(ex->name) - 1);
+  }
+  ex->name[sizeof(ex->name) - 1] = '\0'; 
+  
+  update_workout_ui();
+  window_stack_pop(true);
+}
+
+static void variation_window_load(Window *window) {
+  Layer *w_layer = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(w_layer);
+  
+  s_variation_menu_layer = menu_layer_create(bounds);
+  menu_layer_set_callbacks(s_variation_menu_layer, NULL, (MenuLayerCallbacks){
+    .get_num_rows = variation_get_num_rows_callback,
+    .draw_row = variation_draw_row_callback,
+    .select_click = variation_select_callback,
+  });
+  
+  menu_layer_set_normal_colors(s_variation_menu_layer, GColorWhite, GColorBlack);
+  menu_layer_set_highlight_colors(s_variation_menu_layer, get_theme_color(), GColorWhite);
+  menu_layer_set_click_config_onto_window(s_variation_menu_layer, window);
+  layer_add_child(w_layer, menu_layer_get_layer(s_variation_menu_layer));
+}
+
+static void variation_window_unload(Window *window) {
+  menu_layer_destroy(s_variation_menu_layer);
+}
+
+static void push_variation_window() {
+  if(!s_variation_window) {
+    s_variation_window = window_create();
+    window_set_window_handlers(s_variation_window, (WindowHandlers) { .load = variation_window_load, .unload = variation_window_unload });
+  }
+  window_stack_push(s_variation_window, true);
+}
 
 // --- WORKOUT WINDOW LOGIC ---
 static void progress_update_proc(Layer *layer, GContext *ctx) {
@@ -537,8 +640,22 @@ static void progress_update_proc(Layer *layer, GContext *ctx) {
 
   if (s_total_workout_sets > 0) {
     int completed = 0;
-    for (int i = 0; i < s_curr_ex_idx; i++) completed += s_exercises[i].target_sets;
-    completed += (s_exercises[s_curr_ex_idx].current_set - 1);
+    for (int i = 0; i < s_total_exercises; i++) {
+      if (i < s_curr_ex_idx) {
+        if (s_exercises[i].modifier == 2 && i == s_curr_ex_idx - 1) {
+          completed += s_exercises[i].current_set; // First half of active superset
+        } else {
+          completed += s_exercises[i].target_sets; // Fully completed exercise
+        }
+      } else if (i == s_curr_ex_idx) {
+        completed += (s_exercises[i].current_set - 1); // Current exercise
+      } else if (i > s_curr_ex_idx) {
+        if (i == s_curr_ex_idx + 1 && s_exercises[s_curr_ex_idx].modifier == 2) {
+          completed += (s_exercises[i].current_set - 1); // Second half of active superset
+        }
+      }
+    }
+    
     int width = (bounds.size.w * completed) / s_total_workout_sets;
     graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorIslamicGreen, GColorBlack));
     graphics_fill_rect(ctx, GRect(0, 0, width, bounds.size.h), 0, GCornerNone);
@@ -561,7 +678,6 @@ static void workout_bg_update_proc(Layer *layer, GContext *ctx) {
   int box_y_coord = s_labels_y - (is_tall ? 4 : 2);
   int box_height = (s_target_y + 22) - box_y_coord + (is_tall ? 4 : 2);
 
-  // OPTIMIZATION: Replaced the expensive text measuring functions with our cached integer!
   int center_x = (s_edit_mode == 0) ? (half_w / 2) : (half_w + (half_w / 2));
   GRect highlight_box = GRect(center_x - (s_highlight_box_width / 2), box_y_coord, s_highlight_box_width, box_height);
   graphics_draw_round_rect(ctx, highlight_box, 8); 
@@ -597,13 +713,30 @@ static void update_workout_ui() {
   
   text_layer_set_text(s_exercise_layer, ex->name);
 
+// --- DYNAMIC "NEXT" LABEL LOGIC ---
   static char next_buf[64];
-  if (s_curr_ex_idx + 1 < s_total_exercises) snprintf(next_buf, sizeof(next_buf), "NEXT: %s", s_exercises[s_curr_ex_idx + 1].name);
-  else snprintf(next_buf, sizeof(next_buf), "NEXT: FINISH!");
+  bool is_second_half = (s_curr_ex_idx > 0 && s_exercises[s_curr_ex_idx - 1].modifier == 2);
+  
+  if (is_second_half && ex->current_set < ex->target_sets) {
+      // If we are on the second half of a superset, we bounce BACK to the first half!
+      snprintf(next_buf, sizeof(next_buf), "NEXT: %s", s_exercises[s_curr_ex_idx - 1].name);
+  } else if (s_curr_ex_idx + 1 < s_total_exercises) {
+      snprintf(next_buf, sizeof(next_buf), "NEXT: %s", s_exercises[s_curr_ex_idx + 1].name);
+  } else {
+      snprintf(next_buf, sizeof(next_buf), "NEXT: FINISH!");
+  }
   text_layer_set_text(s_next_exercise_layer, next_buf);
 
+  // --- DROP SET UI LOGIC ---
+  int active_target_weight = ex->target_weight;
   static char set_buf[32];
-  snprintf(set_buf, sizeof(set_buf), "Set %d of %d", ex->current_set, ex->target_sets);
+
+  if (ex->modifier == 1 && (ex->current_set % 2 == 0)) {
+      active_target_weight = (active_target_weight * (100 - s_drop_set_pct)) / 100;
+      snprintf(set_buf, sizeof(set_buf), "Set %d of %d (DROP)", ex->current_set, ex->target_sets);
+  } else {
+      snprintf(set_buf, sizeof(set_buf), "Set %d of %d", ex->current_set, ex->target_sets);
+  }
   text_layer_set_text(s_set_layer, set_buf);
 
   text_layer_set_text(s_label_reps_layer, "Reps");
@@ -613,7 +746,7 @@ static void update_workout_ui() {
 
   static char t_reps_buf[32], t_weight_buf[32], reps_buf[16], weight_buf[16];
   snprintf(t_reps_buf, sizeof(t_reps_buf), "Target: %d", ex->target_reps);
-  snprintf(t_weight_buf, sizeof(t_weight_buf), "Target: %d", ex->target_weight);
+  snprintf(t_weight_buf, sizeof(t_weight_buf), "Target: %d", active_target_weight); 
   snprintf(reps_buf, sizeof(reps_buf), "%d", s_temp_reps);
   snprintf(weight_buf, sizeof(weight_buf), "%d", s_temp_weight);
   
@@ -633,7 +766,6 @@ static void update_workout_ui() {
     text_layer_set_text_color(s_actual_weight_layer, active_color);
   }
 
-  // OPTIMIZATION: Calculate the highlight box width here just ONCE!
   const char *label_str = (s_edit_mode == 0) ? "Reps" : ((s_weight_unit_idx == 0) ? "Weight (kg)" : "Weight (lbs)");
   const char *actual_str = (s_edit_mode == 0) ? reps_buf : weight_buf;
   const char *target_str = (s_edit_mode == 0) ? t_reps_buf : t_weight_buf;
@@ -722,26 +854,71 @@ static void wo_select_long_click(ClickRecognizerRef recognizer, void *context) {
   ex->actual_reps[ex->current_set - 1] = s_temp_reps;
   ex->actual_weight[ex->current_set - 1] = s_temp_weight;
 
-  if (ex->current_set < ex->target_sets) {
-    ex->current_set++;
-    s_rest_seconds_remaining = s_set_rest_sec; 
-    play_vibe(s_set_vibe);
-  } else {
+  // Identify our position in a potential Superset couple
+  bool is_first_half = (ex->modifier == 2 && s_curr_ex_idx + 1 < s_total_exercises);
+  bool is_second_half = (s_curr_ex_idx > 0 && s_exercises[s_curr_ex_idx - 1].modifier == 2);
+
+  if (is_first_half) {
+    // Finished Exercise A: Jump to Exercise B immediately!
     s_curr_ex_idx++;
-    if (s_curr_ex_idx < s_total_exercises) {
-      s_exercises[s_curr_ex_idx].current_set = 1;
-      s_rest_seconds_remaining = s_ex_rest_sec; 
-      play_vibe(s_ex_vibe);
+    s_exercises[s_curr_ex_idx].current_set = ex->current_set; // Keep their sets perfectly synced
+    s_rest_seconds_remaining = s_super_rest_sec;
+    play_vibe(s_set_vibe);
+    
+  } else if (is_second_half) {
+    // Finished Exercise B: Check if we need to bounce back to Exercise A
+    if (ex->current_set < ex->target_sets) {
+      ex->current_set++;
+      s_exercises[s_curr_ex_idx - 1].current_set++; 
+      s_curr_ex_idx--; // BOUNCE BACK!
+      s_rest_seconds_remaining = s_set_rest_sec; // Standard rest after completing the couple
+      play_vibe(s_set_vibe);
     } else {
-      vibes_double_pulse();
-      push_summary_window(); // Lazy load call
-      window_stack_remove(s_workout_window, false);
-      return;
+      // Superset completely finished! Move on to Exercise C.
+      s_curr_ex_idx++; 
+      if (s_curr_ex_idx < s_total_exercises) {
+        s_exercises[s_curr_ex_idx].current_set = 1;
+        s_rest_seconds_remaining = s_ex_rest_sec; 
+        play_vibe(s_ex_vibe);
+      } else {
+        vibes_double_pulse();
+        push_summary_window(); 
+        window_stack_remove(s_workout_window, false);
+        return;
+      }
+    }
+    
+  } else {
+    // NORMAL EXERCISE LOGIC (No Superset)
+    if (ex->current_set < ex->target_sets) {
+      ex->current_set++;
+      s_rest_seconds_remaining = s_set_rest_sec; 
+      play_vibe(s_set_vibe);
+    } else {
+      s_curr_ex_idx++;
+      if (s_curr_ex_idx < s_total_exercises) {
+        s_exercises[s_curr_ex_idx].current_set = 1;
+        s_rest_seconds_remaining = s_ex_rest_sec; 
+        play_vibe(s_ex_vibe);
+      } else {
+        vibes_double_pulse();
+        push_summary_window(); 
+        window_stack_remove(s_workout_window, false);
+        return;
+      }
     }
   }
 
-  s_temp_reps = s_exercises[s_curr_ex_idx].target_reps;
-  s_temp_weight = s_exercises[s_curr_ex_idx].target_weight;
+  // Safely grab the newly selected exercise to pre-fill the screen variables
+  Exercise *next_ex = &s_exercises[s_curr_ex_idx]; 
+  s_temp_reps = next_ex->target_reps;
+  
+  int next_target_weight = next_ex->target_weight;
+  if (next_ex->modifier == 1 && (next_ex->current_set % 2 == 0)) {
+      next_target_weight = (next_target_weight * (100 - s_drop_set_pct)) / 100;
+  }
+  s_temp_weight = next_target_weight;
+  
   s_edit_mode = 0; 
   
   if (s_rest_seconds_remaining > 0) {
@@ -751,10 +928,18 @@ static void wo_select_long_click(ClickRecognizerRef recognizer, void *context) {
   update_workout_ui(); 
 }
 
+static void wo_select_double_click(ClickRecognizerRef recognizer, void *context) {
+  if (s_is_resting) return;
+  push_variation_window();
+}
+
 static void wo_click_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, wo_up_click);
   window_single_click_subscribe(BUTTON_ID_DOWN, wo_down_click);
   window_single_click_subscribe(BUTTON_ID_SELECT, wo_select_short_click);
+  
+  window_multi_click_subscribe(BUTTON_ID_SELECT, 2, 0, 0, true, wo_select_double_click); 
+  
   window_long_click_subscribe(BUTTON_ID_SELECT, s_long_press_ms, wo_select_long_click, NULL); 
 }
 
@@ -781,28 +966,22 @@ static void workout_window_load(Window *window) {
   layer_set_update_proc(s_workout_bg_layer, workout_bg_update_proc);
   layer_add_child(w_layer, s_workout_bg_layer);
 
-  // --- ADAPTIVE TEXT LAYERS ---
   if (is_tall) {
-    // ⌚ EMERY / PEBBLE TIME 2 (Wider screen: 200px)
     s_exercise_layer = build_text_layer(GRect(5, top_margin, bounds.size.w - 10, 32), FONT_KEY_GOTHIC_28_BOLD, PBL_IF_COLOR_ELSE(GColorCobaltBlue, GColorBlack), GTextAlignmentLeft, w_layer);
     s_next_exercise_layer = build_text_layer(GRect(5, top_margin + 28, bounds.size.w - 10, 20), FONT_KEY_GOTHIC_14, GColorBlack, GTextAlignmentLeft, w_layer);
     
-    // Bottom Dashboard (Left: HR, Center: Timer, Right: Clock)
     s_hr_layer = build_text_layer(GRect(5, s_line2_y + 5, 70, 24), FONT_KEY_GOTHIC_18_BOLD, PBL_IF_COLOR_ELSE(GColorRed, GColorBlack), GTextAlignmentLeft, w_layer);
     s_timer_layer = build_text_layer(GRect(75, s_line2_y + 5, 50, 24), FONT_KEY_GOTHIC_18_BOLD, GColorBlack, GTextAlignmentCenter, w_layer);
     s_clock_layer = build_text_layer(GRect(125, s_line2_y + 5, 70, 24), FONT_KEY_GOTHIC_18_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
   } else {
-    // ⌚ PEBBLE 2 / STANDARD (Standard screen: 144px)
     s_exercise_layer = build_text_layer(GRect(2, 6, bounds.size.w - 4, 28), FONT_KEY_GOTHIC_24_BOLD, GColorBlack, GTextAlignmentLeft, w_layer);
     s_next_exercise_layer = build_text_layer(GRect(2, 28, bounds.size.w - 4, 20), FONT_KEY_GOTHIC_14, GColorBlack, GTextAlignmentLeft, w_layer);
     
-    // Bottom Dashboard (Uses FONT_KEY_GOTHIC_14_BOLD so all 3 fit side-by-side perfectly)
     s_hr_layer = build_text_layer(GRect(2, s_line2_y + 4, 52, 20), FONT_KEY_GOTHIC_14_BOLD, GColorBlack, GTextAlignmentLeft, w_layer);
     s_timer_layer = build_text_layer(GRect(54, s_line2_y + 4, 36, 20), FONT_KEY_GOTHIC_14_BOLD, GColorBlack, GTextAlignmentCenter, w_layer);
     s_clock_layer = build_text_layer(GRect(90, s_line2_y + 4, 52, 20), FONT_KEY_GOTHIC_14_BOLD, GColorBlack, GTextAlignmentRight, w_layer);
   }
 
-  // --- MIDDLE SECTION ---
   s_set_layer = build_text_layer(GRect(0, set_y, bounds.size.w, 24), is_tall ? FONT_KEY_GOTHIC_24 : FONT_KEY_GOTHIC_18, GColorBlack, GTextAlignmentCenter, w_layer);
   s_label_reps_layer = build_text_layer(GRect(0, s_labels_y, half_w, 20), FONT_KEY_GOTHIC_14, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
   s_label_weight_layer = build_text_layer(GRect(half_w, s_labels_y, half_w, 20), FONT_KEY_GOTHIC_14, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
@@ -811,7 +990,6 @@ static void workout_window_load(Window *window) {
   s_target_reps_layer = build_text_layer(GRect(0, s_target_y, half_w, 22), FONT_KEY_GOTHIC_18, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
   s_target_weight_layer = build_text_layer(GRect(half_w, s_target_y, half_w, 22), FONT_KEY_GOTHIC_18, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack), GTextAlignmentCenter, w_layer);
 
-  // --- REST OVERLAY COMPONENT ---
   int rest_box_height = s_line2_y - s_line1_y;
   s_rest_overlay_layer = layer_create(GRect(0, s_line1_y, bounds.size.w, rest_box_height));
   layer_set_update_proc(s_rest_overlay_layer, rest_bg_update_proc);
@@ -864,7 +1042,6 @@ static void workout_window_unload(Window *window) {
   text_layer_destroy(s_rest_skip_layer);
 }
 
-
 // --- MAIN MENU WINDOW LOGIC ---
 static uint16_t menu_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
   return (s_active_slots < MAX_SLOTS) ? s_active_slots + 2 : MAX_SLOTS + 1;
@@ -891,11 +1068,11 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
     char saved_data[256];
     persist_read_string(STORAGE_KEY_BASE + i, saved_data, sizeof(saved_data));
     parse_routine_string(saved_data);
-    push_workout_window(); // Lazy load call
+    push_workout_window(); 
   } else if (i == s_active_slots && s_active_slots < MAX_SLOTS) {
-    push_help_window(); // Lazy load call
+    push_help_window(); 
   } else {
-    push_settings_window(); // Lazy load call
+    push_settings_window(); 
   }
 }
 
@@ -903,7 +1080,7 @@ static void menu_select_long_callback(MenuLayer *menu_layer, MenuIndex *cell_ind
   if (cell_index->row < s_active_slots) {
     s_slot_to_edit = cell_index->row;
     s_target_swap_slot = cell_index->row;
-    push_confirm_window(); // Lazy load call
+    push_confirm_window(); 
   }
 }
 
@@ -960,26 +1137,23 @@ static void main_window_unload(Window *window) {
 static void init() {
   load_settings(); 
   
-  // The only window created at startup!
   s_main_window = window_create();
   window_set_window_handlers(s_main_window, (WindowHandlers) { .load = main_window_load, .unload = main_window_unload });
   window_stack_push(s_main_window, true);
   
   app_message_register_inbox_received(inbox_received_callback);
-  
-  // OPTIMIZATION: Specifically request only the buffer size we need! (Saves 1.25KB of RAM)
   app_message_open(256, 512); 
 }
 
 static void deinit() {
-  // Check if windows were loaded before attempting to destroy them to prevent null pointer crashes
   if (s_summary_window) window_destroy(s_summary_window);
   if (s_workout_window) window_destroy(s_workout_window);
   if (s_confirm_window) window_destroy(s_confirm_window);
   if (s_help_window) window_destroy(s_help_window);
   if (s_settings_window) window_destroy(s_settings_window);
+  if (s_variation_window) window_destroy(s_variation_window);
   
-  window_destroy(s_main_window); // Main window always exists
+  window_destroy(s_main_window); 
 }
 
 int main(void) {
