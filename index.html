@@ -371,7 +371,10 @@
 
         function exportJSON() {
             const routineName = document.getElementById("routineName").value || "My_Routine";
-            const finalData = { n: routineName, e: myRoutine };
+            const v2Routine = myRoutine.map(ex => {
+                return [ex[0], ex[1], ex[2], ex[3], ex.length > 4 ? ex[4] : 0];
+            });
+            const finalData = { n: routineName, e: v2Routine };
             const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(finalData));
             const downloadAnchorNode = document.createElement('a');
             downloadAnchorNode.setAttribute("href", dataStr);
@@ -390,7 +393,11 @@
                     const importedData = JSON.parse(e.target.result);
                     if (importedData.n !== undefined && Array.isArray(importedData.e)) {
                         document.getElementById("routineName").value = importedData.n;
-                        myRoutine = importedData.e;
+                        myRoutine = importedData.e.map(ex => {
+                            if (ex.length === 4) ex.push(0); // Append a '0' (Normal) modifier
+                            return ex;
+                        });
+                        
                         renderRoutine();
                         alert("Routine loaded successfully!");
                     } else { alert("Invalid file format."); }
