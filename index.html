@@ -35,14 +35,12 @@
         .mod-badge { font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 10px; margin-left: 5px; color: white; vertical-align: middle;}
         .badge-drop { background-color: #e83e8c; }
         .badge-super { background-color: #007bff; }
-        .badge-super-2 { background-color: #17a2b8; } /* Teal for the second half */
+        .badge-super-2 { background-color: #17a2b8; } 
         
-        /* NEW: Visual styling to link superset pairs together */
         .superset-link { border-left: 4px solid #007bff; background-color: #f4f9ff; }
         .superset-link-top { border-bottom: none; border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: 0; }
         .superset-link-bottom { border-top-left-radius: 0; border-top-right-radius: 0; border-top: 1px dashed #b8daff; }
         
-        /* NEW: Info box for the modifier descriptions */
         .modifier-desc { font-size: 12px; color: #555; background: #f8f9fa; padding: 10px; border-radius: 4px; margin-top: 0px; margin-bottom: 10px; border-left: 3px solid #ccc; line-height: 1.4;}
     </style>
 </head>
@@ -156,7 +154,6 @@
             return defaultValue || false;
         }
 
-        // NEW: Handles updating the description box text based on the dropdown
         function updateModifierDesc() {
             const val = document.getElementById("exerciseModifier").value;
             const desc = document.getElementById("modifierDesc");
@@ -166,10 +163,10 @@
                 desc.style.borderLeftColor = "#ccc";
             } else if (val === "1") {
                 desc.innerHTML = "<strong>Drop Set logic applied:</strong> Automatically doubles the target sets on the watch. You will execute normal weight on odd sets, and dynamic reduced weight on even sets.";
-                desc.style.borderLeftColor = "#e83e8c"; // Pink indicator
+                desc.style.borderLeftColor = "#e83e8c"; 
             } else if (val === "2") {
                 desc.innerHTML = "<strong>Superset logic applied:</strong> Links this exercise visually and functionally with the <strong>NEXT</strong> exercise in the list. The watch will bounce between the two until all sets are completed.";
-                desc.style.borderLeftColor = "#007bff"; // Blue indicator
+                desc.style.borderLeftColor = "#007bff"; 
             }
         }
 
@@ -218,7 +215,7 @@
 
         window.onload = function() {
             renderExerciseDropdown();
-            updateModifierDesc(); // Set initial text
+            updateModifierDesc(); 
             
             const storedUrl = getQueryParam('googleUrl', '');
             if (storedUrl && storedUrl.trim() !== '') {
@@ -310,6 +307,13 @@
                 let ex = myRoutine[i]; 
                 let modifier = ex.length > 4 ? parseInt(ex[4]) : 0; 
                 
+                // SAFETY CHECK 1: The Chain Breaker!
+                // If this is the second half of a superset, it CANNOT initiate another superset.
+                if (isSecondHalf && modifier === 2) {
+                    modifier = 0; 
+                    ex[4] = 0; // Fix the underlying data automatically
+                }
+
                 let badgeHTML = "";
                 if (modifier === 2) badgeHTML += '<span class="mod-badge badge-super">SUPER 1/2</span> ';
                 if (isSecondHalf) badgeHTML += '<span class="mod-badge badge-super-2">SUPER 2/2</span> ';
@@ -318,7 +322,6 @@
                 let div = document.createElement("div");
                 div.className = "exercise-item";
                 
-                // NEW: Apply specific CSS classes to link superset pairs together
                 if (modifier === 2) {
                     div.classList.add("superset-link", "superset-link-top");
                 } else if (isSecondHalf) {
@@ -334,7 +337,6 @@
                 let info = document.createElement("div");
                 info.className = "exercise-info";
                 
-                // Indent the grab handle of the second superset exercise slightly to show attachment
                 let handle = `<span class="grab-handle">≡</span>`;
                 if (isSecondHalf) handle = `<span class="grab-handle" style="color:#007bff; margin-left:8px;">↳</span>`;
                 
@@ -349,7 +351,6 @@
                 div.appendChild(btnGroup);
                 listDiv.appendChild(div);
                 
-                // Flag the NEXT exercise as the second half
                 isSecondHalf = (modifier === 2);
             }
         }
@@ -392,7 +393,7 @@
             document.getElementById("targetReps").value = "";
             document.getElementById("targetWeight").value = "";
             document.getElementById("exerciseModifier").value = "0"; 
-            updateModifierDesc(); // Reset description
+            updateModifierDesc(); 
         }
 
         function deleteExercise(index) { myRoutine.splice(index, 1); renderRoutine(); }
@@ -407,7 +408,7 @@
             document.getElementById("targetWeight").value = ex[3];
             
             document.getElementById("exerciseModifier").value = ex.length > 4 ? ex[4] : "0";
-            updateModifierDesc(); // Update description to match the edit
+            updateModifierDesc(); 
 
             editingIndex = index;
             document.getElementById("formTitle").innerText = "Edit Exercise";
@@ -416,6 +417,16 @@
         }
 
         function exportJSON() {
+            // SAFETY CHECK 2: Dangling Superset Catcher for Export
+            if (myRoutine.length > 0) {
+                let lastEx = myRoutine[myRoutine.length - 1];
+                let lastMod = lastEx.length > 4 ? parseInt(lastEx[4]) : 0;
+                if (lastMod === 2) {
+                    alert("Export failed: The last exercise in your routine is marked as a Superset, but there is no exercise below it to pair with! Please edit it.");
+                    return;
+                }
+            }
+
             const routineName = document.getElementById("routineName").value || "My_Routine";
             const v2Routine = myRoutine.map(ex => {
                 return [ex[0], ex[1], ex[2], ex[3], ex.length > 4 ? ex[4] : 0];
@@ -453,6 +464,16 @@
         }
 
         function saveAndSend() {
+            // SAFETY CHECK 2: Dangling Superset Catcher for Sending to Watch
+            if (myRoutine.length > 0) {
+                let lastEx = myRoutine[myRoutine.length - 1];
+                let lastMod = lastEx.length > 4 ? parseInt(lastEx[4]) : 0;
+                if (lastMod === 2) {
+                    alert("Send failed: The last exercise in your routine is marked as a Superset, but there is no exercise below it to pair with! Please edit it.");
+                    return;
+                }
+            }
+
             const routineName = document.getElementById("routineName").value || "My Routine";
             if (myRoutine.length === 0 && !shouldClearHistory && !shouldClearGoogle) {
                 if(!document.getElementById("googleUrlInput").value && !document.getElementById("googlePwdInput").value){
