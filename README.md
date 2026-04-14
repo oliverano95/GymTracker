@@ -79,3 +79,6 @@ For power users, you can bypass the manual CSV download and have the watch beam 
 5. Click **Save & Send to Pebble**.
 
 You're done! Your phone will securely remember this link. The next time you finish a workout on your watch, it will automatically populate the workout in your Google Sheet!
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
