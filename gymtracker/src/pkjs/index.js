@@ -8,7 +8,7 @@ Pebble.addEventListener('ready', function(e) {
 // 2. Open the configuration web page when the user clicks "Settings"
 Pebble.addEventListener('showConfiguration', function(e) {
   // Your live GitHub Pages link
-  var myConfigUrl = 'https://oliverano95.github.io/GymTracker/';
+  var myConfigUrl = 'https://silentjay.github.io/solid-lamp/';
   
   // Retrieve saved settings and workout history from the phone's local memory
   var googleUrl = localStorage.getItem('googleUrl') || '';
@@ -48,9 +48,19 @@ Pebble.addEventListener('webviewclosed', function(e) {
     }
 
     if (configData.routineData && configData.routineData !== "") {
-      Pebble.sendAppMessage({
+      var appMessageData = {
         "ROUTINE_DATA": configData.routineData
-      }, function() {
+      };
+      
+      // Send progression settings if provided
+      if (configData.progressionMode !== undefined) {
+        appMessageData["PROGRESSION_MODE"] = parseInt(configData.progressionMode);
+      }
+      if (configData.weightIncrement !== undefined) {
+        appMessageData["WEIGHT_INCREMENT"] = parseInt(configData.weightIncrement);
+      }
+      
+      Pebble.sendAppMessage(appMessageData, function() {
         console.log("Routine sent to watch successfully!");
       }, function(err) {
         console.log("Failed to send routine to watch: " + JSON.stringify(err));

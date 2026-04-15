@@ -37,6 +37,9 @@ static int s_weight_unit_idx = 0;
 static int s_long_press_ms = 500; 
 static int s_drop_set_pct = 20; 
 static int s_super_rest_sec = 15;
+static int s_progression_mode = -1;
+static int s_weight_increment = 2;
+static int s_current_slot = 0;
 
 // --- WORKOUT TRACKING ---
 static int s_curr_ex_idx = 0;
@@ -138,6 +141,8 @@ static void load_settings() {
   if(persist_exists(SETTINGS_KEY_BASE + 7)) s_long_press_ms = persist_read_int(SETTINGS_KEY_BASE + 7);
   if(persist_exists(SETTINGS_KEY_BASE + 8)) s_drop_set_pct = persist_read_int(SETTINGS_KEY_BASE + 8);
   if(persist_exists(SETTINGS_KEY_BASE + 9)) s_super_rest_sec = persist_read_int(SETTINGS_KEY_BASE + 9);
+  if(persist_exists(SETTINGS_KEY_BASE + 10)) s_progression_mode = persist_read_int(SETTINGS_KEY_BASE + 10);
+  if(persist_exists(SETTINGS_KEY_BASE + 11)) s_weight_increment = persist_read_int(SETTINGS_KEY_BASE + 11);
 }
 
 static void save_setting(int key_offset, int value) {
@@ -512,6 +517,51 @@ static void summary_window_load(Window *window) {
   snprintf(missed_buf, sizeof(missed_buf), "Missed\n%d", sets_below);
   text_layer_set_text(s_beat_layer, beat_buf);
   text_layer_set_text(s_missed_layer, missed_buf);
+  
+  if (s_progression_mode != -1) {
+    for (int i = 0; i < s_total_exercises; i++) {
+      bool target_met = false;
+      Exercise *ex = &s_exercises[i];
+      
+      for (int j = 0; j < ex->target_sets; j++) {
+        int a_r = ex->actual_reps[j];
+        int a_w = ex->actual_weight[j];
+        int t_r = ex->target_reps;
+        
+        int t_w = ex->target_weight;
+        if (ex->modifier == 1 && ((j + 1) % 2 == 0)) {
+          t_w = (t_w * (100 - s_drop_set_pct)) / 100;
+        }
+        
+        if (a_w >= t_w && a_r >= t_r) {
+          target_met = true;
+          break;
+        }
+      }
+      
+      if (target_met) {
+        if (s_progression_mode == 0) {
+          ex->target_weight += s_weight_increment;
+        } else if (s_progression_mode == 1) {
+          ex->target_reps += 1;
+        }
+      }
+    }
+    
+    static char updated_routine[256];
+    snprintf(updated_routine, sizeof(updated_routine), "%s", s_routine_name);
+    for (int i = 0; i < s_total_exercises; i++) {
+      char ex_str[64];
+      snprintf(ex_str, sizeof(ex_str), "|%s|%d|%d|%d|%d",
+        s_exercises[i].name,
+        s_exercises[i].target_sets,
+        s_exercises[i].target_reps,
+        s_exercises[i].target_weight,
+        s_exercises[i].modifier);
+      strcat(updated_routine, ex_str);
+    }
+    persist_write_string(STORAGE_KEY_BASE + s_current_slot, updated_routine);
+  }
 
   time_t temp = time(NULL);
   struct tm *tick_time = localtime(&temp);
@@ -1065,6 +1115,7 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
   int i = cell_index->row;
   
   if (i < s_active_slots) {
+    s_current_slot = i;
     char saved_data[256];
     persist_read_string(STORAGE_KEY_BASE + i, saved_data, sizeof(saved_data));
     parse_routine_string(saved_data);
@@ -1098,6 +1149,18 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     persist_write_string(STORAGE_KEY_BASE + target_slot, safe_buffer);
     refresh_directory();
     menu_layer_reload_data(s_menu_layer);
+  }
+  
+  Tuple *prog_mode_tuple = dict_find(iterator, MESSAGE_KEY_PROGRESSION_MODE);
+  if (prog_mode_tuple && prog_mode_tuple->type == TUPLE_INT) {
+    s_progression_mode = prog_mode_tuple->value->int32;
+    persist_write_int(SETTINGS_KEY_BASE + 10, s_progression_mode);
+  }
+  
+  Tuple *weight_inc_tuple = dict_find(iterator, MESSAGE_KEY_WEIGHT_INCREMENT);
+  if (weight_inc_tuple && weight_inc_tuple->type == TUPLE_INT) {
+    s_weight_increment = weight_inc_tuple->value->int32;
+    persist_write_int(SETTINGS_KEY_BASE + 11, s_weight_increment);
   }
 }
 
