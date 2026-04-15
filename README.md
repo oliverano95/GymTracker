@@ -6,7 +6,7 @@ A fully-featured, standalone workout tracker for Pebble smartwatches with smart 
 
 You can install the app directly from the App Store here: https://apps.repebble.com/0664a987078943a28f196064
 
-You can configure your routines using the companion website here: [https://oliverano95.github.io/solid-lamp/](https://oliverano95.github.io/GymTracker/)
+You can configure your routines using the companion website here: [https://oliverano95.github.io/GymTracker/](https://oliverano95.github.io/GymTracker/)
 
 ## Features
 * **Phone-Free Tracking:** Log reps and weight directly from your wrist.
