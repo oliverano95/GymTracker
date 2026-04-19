@@ -12,7 +12,9 @@
         "enableMultiJS": true,
         "messageKeys": [
             "ROUTINE_DATA",
-            "WORKOUT_SUMMARY"
+            "WORKOUT_SUMMARY",
+            "PROGRESSION_MODE",
+            "WEIGHT_INCREMENT"
         ],
         "projectType": "native",
         "resources": {
@@ -45,5 +47,5 @@
             "watchface": false
         }
     },
-    "version": "2.0.0"
+    "version": "2.1.0"
 }

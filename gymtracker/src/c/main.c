@@ -25,6 +25,9 @@ static int s_total_workout_sets = 0;
 static char s_slot_names[MAX_SLOTS][32];
 static int s_slot_counts[MAX_SLOTS];
 static int s_active_slots = 0; 
+static int s_progression_mode = -1;
+static int s_weight_increment = 2;
+static int s_current_slot = 0;
 
 // --- USER SETTINGS ---
 static int s_set_rest_sec = 60;
@@ -492,6 +495,8 @@ static void summary_window_load(Window *window) {
 
   int sets_above = 0, sets_below = 0;
   for (int i = 0; i < s_total_exercises; i++) {
+    int ex_misses = 0; // Track misses per exercise for progression
+    
     for (int j = 0; j < s_exercises[i].target_sets; j++) {
       int a_r = s_exercises[i].actual_reps[j];
       int a_w = s_exercises[i].actual_weight[j];
@@ -503,8 +508,40 @@ static void summary_window_load(Window *window) {
       }
       
       if (a_w > t_w || (a_w == t_w && a_r > t_r)) sets_above++;
-      else if (a_w < t_w || (a_w == t_w && a_r < t_r)) sets_below++;
+      else if (a_w < t_w || (a_w == t_w && a_r < t_r)) {
+          sets_below++;
+          ex_misses++; // Flag this exercise as a failure
+      }
     }
+    
+    // PROGRESSION LOGIC: If we didn't miss any sets, level up!
+    if (s_progression_mode != -1 && ex_misses == 0) {
+      if (s_progression_mode == 0) s_exercises[i].target_weight += s_weight_increment;
+      else if (s_progression_mode == 1) s_exercises[i].target_reps += 1;
+    }
+  }
+
+  // If progression is on, rebuild the string (using the V2.2 5-field format) and save it!
+  if (s_progression_mode != -1) {
+    char updated_routine[256];
+    int r_limit = sizeof(updated_routine);
+    int r_written = snprintf(updated_routine, r_limit, "%s", s_routine_name);
+    int r_offset = (r_written < r_limit) ? r_written : r_limit - 1;
+
+    for (int i = 0; i < s_total_exercises; i++) {
+      if (r_offset >= r_limit - 1) break;
+      
+      // Because Drop Sets doubled the target_sets in memory, we must halve them for storage
+      int base_sets = s_exercises[i].target_sets;
+      if (s_exercises[i].modifier == 1) base_sets = base_sets / 2;
+
+      r_written = snprintf(updated_routine + r_offset, r_limit - r_offset, "|%s|%d|%d|%d|%d",
+          s_exercises[i].name, base_sets, s_exercises[i].target_reps, 
+          s_exercises[i].target_weight, s_exercises[i].modifier);
+          
+      r_offset += (r_written < r_limit - r_offset) ? r_written : r_limit - r_offset - 1;
+    }
+    persist_write_string(STORAGE_KEY_BASE + s_current_slot, updated_routine);
   }
 
   static char beat_buf[32], missed_buf[32];
@@ -1065,6 +1102,7 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
   int i = cell_index->row;
   
   if (i < s_active_slots) {
+    s_current_slot = i; // NEW: Track the active slot
     char saved_data[256];
     persist_read_string(STORAGE_KEY_BASE + i, saved_data, sizeof(saved_data));
     parse_routine_string(saved_data);
@@ -1098,6 +1136,18 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     persist_write_string(STORAGE_KEY_BASE + target_slot, safe_buffer);
     refresh_directory();
     menu_layer_reload_data(s_menu_layer);
+  }
+  
+  Tuple *prog_mode_tuple = dict_find(iterator, MESSAGE_KEY_PROGRESSION_MODE);
+  if (prog_mode_tuple) {
+    s_progression_mode = prog_mode_tuple->value->int32;
+    persist_write_int(SETTINGS_KEY_BASE + 10, s_progression_mode);
+  }
+
+  Tuple *weight_inc_tuple = dict_find(iterator, MESSAGE_KEY_WEIGHT_INCREMENT);
+  if (weight_inc_tuple) {
+    s_weight_increment = weight_inc_tuple->value->int32;
+    persist_write_int(SETTINGS_KEY_BASE + 11, s_weight_increment);
   }
 }
 

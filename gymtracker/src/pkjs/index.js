@@ -28,7 +28,7 @@ Pebble.addEventListener('webviewclosed', function(e) {
   if (e.response && e.response !== 'CANCELLED' && e.response !== '[]') {
     var configData = JSON.parse(decodeURIComponent(e.response));
     
-    // NEW: If the user clicked "Clear Credentials" on the site, wipe them from the phone
+    // If the user clicked "Clear Credentials" on the site, wipe them from the phone
     if (configData.clearGoogle) {
       localStorage.removeItem('googleUrl');
       localStorage.removeItem('googlePwd');
@@ -47,13 +47,27 @@ Pebble.addEventListener('webviewclosed', function(e) {
       localStorage.setItem('workoutHistory', '[]');
     }
 
+    // NEW: Build a combined data package to send to the watch
+    var appMessageData = {};
+
     if (configData.routineData && configData.routineData !== "") {
-      Pebble.sendAppMessage({
-        "ROUTINE_DATA": configData.routineData
-      }, function() {
-        console.log("Routine sent to watch successfully!");
+      appMessageData["ROUTINE_DATA"] = configData.routineData;
+    }
+    
+    // Grab silentjay's progression variables
+    if (configData.progressionMode !== undefined) {
+      appMessageData["PROGRESSION_MODE"] = parseInt(configData.progressionMode);
+    }
+    if (configData.weightIncrement !== undefined) {
+      appMessageData["WEIGHT_INCREMENT"] = parseInt(configData.weightIncrement);
+    }
+
+    // Send the combined payload
+    if (Object.keys(appMessageData).length > 0) {
+      Pebble.sendAppMessage(appMessageData, function() {
+        console.log("Data sent to watch successfully!");
       }, function(err) {
-        console.log("Failed to send routine to watch: " + JSON.stringify(err));
+        console.log("Failed to send data to watch: " + JSON.stringify(err));
       });
     }
   }
