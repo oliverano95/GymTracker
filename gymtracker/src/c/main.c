@@ -1277,10 +1277,16 @@ static void update_workout_ui(bool animate_box) {
   text_layer_set_text(s_next_exercise_layer, next_buf);
 
   int active_target_weight = ex->target_weight;
+  int active_target_reps = ex->target_reps;
   static char set_buf[32];
+  bool is_bodyweight = (ex->target_weight == 0 || ex->modifier == 4);
 
   if (ex->modifier == 1 && (ex->current_set % 2 == 0)) {
-      active_target_weight = (active_target_weight * (100 - s_drop_set_pct)) / 100;
+      if (is_bodyweight) {
+          active_target_reps = ex->target_reps - (ex->target_reps * s_drop_set_pct / 100);
+      } else {
+          active_target_weight = (active_target_weight * (100 - s_drop_set_pct)) / 100;
+      }
       snprintf(set_buf, sizeof(set_buf), "Set %d of %d (DROP)", ex->current_set, ex->target_sets);
   } else if (ex->modifier == 3) {
       snprintf(set_buf, sizeof(set_buf), "Set %d of %d (WARM)", ex->current_set, ex->target_sets);
@@ -1295,7 +1301,7 @@ static void update_workout_ui(bool animate_box) {
   else text_layer_set_text(s_label_weight_layer, "Weight (lbs)");
 
   static char t_reps_buf[32], t_weight_buf[32], reps_buf[16], weight_buf[16];
-  snprintf(t_reps_buf, sizeof(t_reps_buf), "Target: %d", ex->target_reps);
+  snprintf(t_reps_buf, sizeof(t_reps_buf), "Target: %d", active_target_reps);
   snprintf(reps_buf, sizeof(reps_buf), "%d", s_temp_reps);
 
   if (s_weight_unit_idx == 0) text_layer_set_text(s_label_weight_layer, "Weight (kg)");
@@ -1386,10 +1392,15 @@ static void swap_exercise() {
 
   Exercise *new_ex = &s_exercises[s_curr_ex_idx];
   s_temp_reps = new_ex->target_reps;
-  
+
   int active_weight = new_ex->target_weight;
+  bool is_bodyweight = (new_ex->target_weight == 0 || new_ex->modifier == 4);
   if (new_ex->modifier == 1 && (new_ex->current_set % 2 == 0)) {
-      active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
+      if (is_bodyweight) {
+          s_temp_reps = new_ex->target_reps - (new_ex->target_reps * s_drop_set_pct / 100);
+      } else {
+          active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
+      }
   }
   s_temp_weight = active_weight;
   
@@ -1429,9 +1440,14 @@ static void perform_true_skip() {
      Exercise *new_ex = &s_exercises[s_curr_ex_idx];
      s_temp_reps = new_ex->target_reps;
      s_temp_weight = new_ex->target_weight;
-     
+
+     bool is_bodyweight = (new_ex->target_weight == 0 || new_ex->modifier == 4);
      if (new_ex->modifier == 1 && (new_ex->current_set % 2 == 0)) {
-         s_temp_weight = (s_temp_weight * (100 - s_drop_set_pct)) / 100;
+         if (is_bodyweight) {
+             s_temp_reps = new_ex->target_reps - (new_ex->target_reps * s_drop_set_pct / 100);
+         } else {
+             s_temp_weight = (s_temp_weight * (100 - s_drop_set_pct)) / 100;
+         }
      }
      
      s_is_resting = false;
@@ -1511,12 +1527,17 @@ static void perform_finish_set() {
     }
   }
 
-  Exercise *next_ex = &s_exercises[s_curr_ex_idx]; 
+  Exercise *next_ex = &s_exercises[s_curr_ex_idx];
   s_temp_reps = next_ex->target_reps;
-  
+
   int next_target_weight = next_ex->target_weight;
+  bool is_bodyweight = (next_ex->target_weight == 0 || next_ex->modifier == 4);
   if (next_ex->modifier == 1 && (next_ex->current_set % 2 == 0)) {
-      next_target_weight = (next_target_weight * (100 - s_drop_set_pct)) / 100;
+      if (is_bodyweight) {
+          s_temp_reps = next_ex->target_reps - (next_ex->target_reps * s_drop_set_pct / 100);
+      } else {
+          next_target_weight = (next_target_weight * (100 - s_drop_set_pct)) / 100;
+      }
   }
   s_temp_weight = next_target_weight;
   
@@ -2101,10 +2122,15 @@ static void start_workout_from_slot(int slot_idx) {
   s_total_hr = 0;
   s_hr_samples = 0;
   s_temp_reps = s_exercises[0].target_reps;
-  
+
   int active_weight = s_exercises[0].target_weight;
+  bool is_bodyweight = (s_exercises[0].target_weight == 0 || s_exercises[0].modifier == 4);
   if (s_exercises[0].modifier == 1 && (s_exercises[0].current_set % 2 == 0)) {
-      active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
+      if (is_bodyweight) {
+          s_temp_reps = s_exercises[0].target_reps - (s_exercises[0].target_reps * s_drop_set_pct / 100);
+      } else {
+          active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
+      }
   }
   s_temp_weight = active_weight;
   
@@ -2147,8 +2173,13 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
       
       s_temp_reps = s_exercises[s_curr_ex_idx].target_reps;
       int active_weight = s_exercises[s_curr_ex_idx].target_weight;
+      bool is_bodyweight = (s_exercises[s_curr_ex_idx].target_weight == 0 || s_exercises[s_curr_ex_idx].modifier == 4);
       if (s_exercises[s_curr_ex_idx].modifier == 1 && (s_exercises[s_curr_ex_idx].current_set % 2 == 0)) {
-          active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
+          if (is_bodyweight) {
+              s_temp_reps = s_exercises[s_curr_ex_idx].target_reps - (s_exercises[s_curr_ex_idx].target_reps * s_drop_set_pct / 100);
+          } else {
+              active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
+          }
       }
       s_temp_weight = active_weight;
       
