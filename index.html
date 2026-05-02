@@ -79,23 +79,6 @@
                 <button type="button" class="small-btn delete-btn" onclick="deleteRoutine()" style="margin: 0; white-space: nowrap;">Delete</button>
             </div>
         </div>
-            <input type="file" id="importFile" accept=".json" style="display: none;" onchange="importJSON(event)">
-            
-            <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
-            
-            <h4 style="margin-top: 0;">Mobile Import / Export</h4>
-
-			<div id="syncContainer" style="display: none; background: #e8f4f8; padding: 10px; border: 1px solid #b8daff; border-radius: 4px; margin-bottom: 15px;">
-                <label style="font-size: 12px; font-weight: bold; color: #004085; display: flex; align-items: center; cursor: pointer;">
-                    <input type="checkbox" id="autoSyncCheckbox" style="margin-right: 8px;" onchange="saveAutoSyncPreference()">
-                    Auto-sync progressions
-                </label>
-                <p style="font-size: 10px; margin: 5px 0 0 0; color: #004085;">Automatically update routine after watch workout completes.</p>
-            </div>
-			
-            <p style="font-size: 12px; color: gray; margin-top: 0;">If you are inside the Pebble app, use this text box to copy and paste routines instead of using files.</p>
-            
-            <textarea id="routineTextArea" rows="3" style="font-family: monospace; font-size: 11px; resize: vertical;" placeholder='{"n":"My Routine","e":[...]}'></textarea>
             
             <div class="flex-row">
                 <button type="button" class="small-btn secondary-btn" style="margin: 0; flex: 1;" onclick="exportToText()">1. Generate Text</button>

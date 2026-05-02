@@ -187,6 +187,20 @@
             </div>
             <button type="button" class="small-btn" style="margin: 10px 0 0 0; width: 100%; background-color: #28a745;" onclick="importFromText()">Import Pasted Text</button>
         </div>
+
+        <div class="card">
+            <h3 style="margin-top: 0;">Workout History</h3>
+            <p style="font-size: 12px; color: gray; margin-top: 0;">Workouts are saved locally to your phone. Download them here.</p>
+            
+            <div id="historyList" style="max-height: 250px; overflow-y: auto; background: #fafafa; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 10px; padding: 5px;">
+                <p style="font-size: 12px; text-align: center; color: gray;">Loading history...</p>
+            </div>
+            
+            <div class="flex-row">
+                <button onclick="downloadCSV()">Download CSV</button>
+                <button class="secondary-btn delete-btn" onclick="clearHistory()">Clear History</button>
+            </div>
+        </div>
     </div>
 
     <div id="tab-cloud" class="tab-content">
