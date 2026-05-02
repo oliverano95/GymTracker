@@ -83,13 +83,11 @@
             <h4 style="margin-top: 0;">Mobile Import / Export</h4>
 
 			<div id="syncContainer" style="display: none; background: #e8f4f8; padding: 10px; border: 1px solid #b8daff; border-radius: 4px; margin-bottom: 15px;">
-                <label style="font-size: 12px; font-weight: bold; color: #004085;">📥 Watch Auto-Progression Sync:</label>
-                <div class="flex-row" style="margin-top: 5px;">
-                    <select id="syncSelect" style="margin: 0;"></select>
-                    <button type="button" class="small-btn" style="background-color: #007bff; margin: 0; white-space: nowrap;" onclick="loadSyncedRoutine()">Load</button>
-                    <button type="button" class="small-btn delete-btn" style="margin: 0; white-space: nowrap;" onclick="deleteSyncedRoutine()">Delete</button>
-                </div>
-                <p style="font-size: 10px; margin: 5px 0 0 0; color: #004085;">Loads updated targets from your last completed watch workout.</p>
+                <label style="font-size: 12px; font-weight: bold; color: #004085; display: flex; align-items: center; cursor: pointer;">
+                    <input type="checkbox" id="autoSyncCheckbox" style="margin-right: 8px;" onchange="saveAutoSyncPreference()">
+                    Auto-sync progressions
+                </label>
+                <p style="font-size: 10px; margin: 5px 0 0 0; color: #004085;">Automatically update routine after watch workout completes.</p>
             </div>
 			
             <p style="font-size: 12px; color: gray; margin-top: 0;">If you are inside the Pebble app, use this text box to copy and paste routines instead of using files.</p>
@@ -101,6 +99,16 @@
                 <button type="button" class="small-btn secondary-btn" style="margin: 0; flex: 1;" onclick="copyText()">2. Copy Text</button>
             </div>
             <button type="button" class="small-btn" style="margin: 10px 0 0 0; width: 100%; background-color: #28a745;" onclick="importFromText()">⬇️ Import Pasted Text</button>
+        </div>
+
+        <div class="card">
+            <label>Saved Routines:</label>
+            <div class="flex-row">
+                <select id="savedRoutineSelect" onchange="selectRoutine()" style="margin: 0; flex: 1;">
+                    <option value="">-- New Routine --</option>
+                </select>
+                <button type="button" class="small-btn delete-btn" onclick="deleteRoutine()" style="margin: 0; white-space: nowrap;">Delete</button>
+            </div>
         </div>
 
         <div class="card">
@@ -213,7 +221,7 @@
         </div>
     </div>
 
-    <button onclick="saveAndSend()" style="padding: 15px; font-size: 18px; margin-bottom: 40px; box-shadow: 0 4px 6px rgba(0,0,0,0.2);">Save & Send to Pebble</button>
+    <button onclick="saveAndPush()" style="padding: 15px; font-size: 18px; margin-bottom: 40px; box-shadow: 0 4px 6px rgba(0,0,0,0.2);">Save & Push to Watch</button>
 
     <script>
         const exerciseDatabase = {
@@ -365,6 +373,7 @@
             renderExerciseDropdown();
             updateModifierDesc(); 
             updateProgressionUI();
+            loadSavedRoutines();
             
             const storedUrl = getQueryParam('googleUrl', '');
             if (storedUrl && storedUrl.trim() !== '') {
@@ -375,22 +384,11 @@
             try { workoutHistory = JSON.parse(historyStr); } catch(e) { workoutHistory = []; }
             renderHistory();
 
-            // V5.0 TWO-WAY SYNC INIT
-            const syncStr = getQueryParam('sync', '{}');
-            try { 
-                syncedRoutinesDict = JSON.parse(syncStr); 
-                const syncKeys = Object.keys(syncedRoutinesDict);
-                if (syncKeys.length > 0) {
-                    document.getElementById('syncContainer').style.display = 'block';
-                    const syncDropdown = document.getElementById("syncSelect");
-                    syncKeys.forEach(key => {
-                        const opt = document.createElement("option");
-                        opt.value = key;
-                        opt.text = key;
-                        syncDropdown.appendChild(opt);
-                    });
-                }
-            } catch(e) {}
+            // Show sync container if auto-sync is enabled
+            const autoSyncEnabled = getAutoSyncEnabled();
+            if (autoSyncEnabled) {
+                document.getElementById('syncContainer').style.display = 'block';
+            }
         };
 
         function flagClearGoogle() {
@@ -748,7 +746,7 @@
             reader.readAsText(file);
         }
 
-        function saveAndSend() {
+        function saveAndPush() {
             if (myRoutine.length > 0) {
                 let lastEx = myRoutine[myRoutine.length - 1];
                 let lastMod = lastEx.length > 4 ? parseInt(lastEx[4]) : 0;
@@ -784,6 +782,17 @@
                 return; 
             }
 
+            // Save to localStorage first
+            saveRoutineToStorage(
+                routineName,
+                myRoutine,
+                document.getElementById("progressionMode").value,
+                document.getElementById("weightIncrement").value
+            );
+
+            // Reload dropdown to reflect saved routine
+            loadSavedRoutines();
+
             const configData = {
                 routineData: delimitedString,
                 progressionMode: document.getElementById("progressionMode").value,
@@ -799,68 +808,178 @@
             window.location.href = returnTo + encodeURIComponent(JSON.stringify(configData));
         }
 
-		let syncedRoutinesDict = {};
+let syncedRoutinesDict = {};
 
-        function loadSyncedRoutine() {
-            const selectedName = document.getElementById("syncSelect").value;
-            const syncString = syncedRoutinesDict[selectedName];
-            if (!syncString) return;
+        // ===== LOCAL STORAGE ROUTINE FUNCTIONS =====
+        function getSavedRoutines() {
+            try {
+                const saved = localStorage.getItem("savedRoutines");
+                return saved ? JSON.parse(saved) : [];
+            } catch (e) {
+                console.error("Error loading saved routines:", e);
+                return [];
+            }
+        }
 
-            const parts = syncString.split('|');
-            document.getElementById("routineName").value = parts[0];
-            
-            let startIndex = 1;
-            
-            // V5.0 UX FIX: Check if the string contains the new Progression Settings
-            // (If the second item is -1, 0, or 1, we know it's the Progression Mode!)
-            if (parts[1] === "-1" || parts[1] === "0" || parts[1] === "1") {
-                document.getElementById("progressionMode").value = parts[1];
-                document.getElementById("weightIncrement").value = parts[2];
-                updateProgressionUI(); // Update the green/blue info box automatically
-                startIndex = 3; // Shift the loop start index past the new data
+        function getLastRoutine() {
+            try {
+                return localStorage.getItem("lastRoutine") || "";
+            } catch (e) {
+                return "";
+            }
+        }
+
+        function getAutoSyncEnabled() {
+            try {
+                return localStorage.getItem("autoSyncEnabled") === "true";
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function saveAutoSyncPreference() {
+            try {
+                const enabled = document.getElementById("autoSyncCheckbox").checked;
+                localStorage.setItem("autoSyncEnabled", enabled ? "true" : "false");
+            } catch (e) {
+                console.error("Error saving auto-sync preference:", e);
+            }
+        }
+
+        function loadSavedRoutines() {
+            const routines = getSavedRoutines();
+            const lastRoutine = getLastRoutine();
+            const select = document.getElementById("savedRoutineSelect");
+
+            while (select.options.length > 1) {
+                select.remove(1);
             }
 
-            myRoutine = [];
-            
-            // Loop through the delimited string (6 fields per exercise)
-            for (let i = startIndex; i < parts.length; i += 6) {
-                if(parts[i]) {
-                    let name = parts[i];
-                    let sets = parseInt(parts[i+1]);
-                    let reps = parseInt(parts[i+2]);
-                    let weight = parseInt(parts[i+3]);
-                    let mod = parseInt(parts[i+4]);
-                    let comment = parts[i+5] === "-" ? "" : parts[i+5];
-                    
-                    myRoutine.push([name, sets, reps, weight, mod, comment]);
-                }
+            routines.forEach((r, index) => {
+                const option = document.createElement("option");
+                option.value = r.name;
+                option.textContent = r.name + " (" + r.exercises.length + " exercises)";
+                select.appendChild(option);
+            });
+
+            if (routines.length === 0) {
+                const option = document.createElement("option");
+                option.value = "";
+                option.textContent = "-- No saved routines --";
+                option.disabled = true;
+                select.appendChild(option);
             }
+
+            document.getElementById("autoSyncCheckbox").checked = getAutoSyncEnabled();
+
+            if (lastRoutine && routines.some(r => r.name === lastRoutine)) {
+                select.value = lastRoutine;
+                selectRoutine();
+            } else if (routines.length > 0) {
+                select.value = routines[0].name;
+                selectRoutine();
+            }
+        }
+
+        function selectRoutine() {
+            const select = document.getElementById("savedRoutineSelect");
+            const routineName = select.value;
+
+            if (!routineName) {
+                document.getElementById("routineName").value = "";
+                document.getElementById("progressionMode").value = "2";
+                document.getElementById("weightIncrement").value = "2.5";
+                myRoutine = [];
+                renderRoutine();
+                updateProgressionUI();
+                return;
+            }
+
+            const routines = getSavedRoutines();
+            const routine = routines.find(r => r.name === routineName);
+
+            if (!routine) return;
+
+            document.getElementById("routineName").value = routine.name;
+            document.getElementById("progressionMode").value = routine.progressionMode || "2";
+            document.getElementById("weightIncrement").value = routine.weightIncrement || "2.5";
+            myRoutine = routine.exercises || [];
             renderRoutine();
-            
-            // Switch back to the Builder tab so they can see the loaded routine
-            document.querySelector('.tab-btn[onclick*="tab-builder"]').click();
-            alert("✅ Auto-Progressed routine targets successfully loaded from watch!");
-        }
+            updateProgressionUI();
 
-		function deleteSyncedRoutine() {
-            const syncDropdown = document.getElementById("syncSelect");
-            if (syncDropdown.options.length === 0) return;
-            
-            const selectedName = syncDropdown.value;
-            if (confirm("Remove '" + selectedName + "' from your synced auto-progression list?")) {
-                
-                // 1. Remove it from our local dictionary
-                delete syncedRoutinesDict[selectedName];
-                
-                // 2. Remove it from the visual dropdown
-                syncDropdown.remove(syncDropdown.selectedIndex);
-                
-                // 3. Hide the whole box if that was the last one!
-                if (syncDropdown.options.length === 0) {
-                    document.getElementById('syncContainer').style.display = 'none';
-                }
+            try {
+                localStorage.setItem("lastRoutine", routine.name);
+            } catch (e) {
+                console.error("Error saving last routine:", e);
             }
         }
+
+        function deleteRoutine() {
+            const select = document.getElementById("savedRoutineSelect");
+            const routineName = select.value;
+
+            if (!routineName) {
+                alert("No routine selected to delete.");
+                return;
+            }
+
+            if (!confirm("Delete '" + routineName + "' from saved routines?")) {
+                return;
+            }
+
+            let routines = getSavedRoutines();
+            routines = routines.filter(r => r.name !== routineName);
+
+            try {
+                localStorage.setItem("savedRoutines", JSON.stringify(routines));
+
+                if (getLastRoutine() === routineName) {
+                    localStorage.removeItem("lastRoutine");
+                }
+
+                document.getElementById("routineName").value = "";
+                document.getElementById("progressionMode").value = "2";
+                document.getElementById("weightIncrement").value = "2.5";
+                myRoutine = [];
+                renderRoutine();
+                updateProgressionUI();
+
+                loadSavedRoutines();
+            } catch (e) {
+                console.error("Error deleting routine:", e);
+                alert("Error deleting routine. Please try again.");
+            }
+        }
+
+        function saveRoutineToStorage(routineName, exercises, progressionMode, weightIncrement) {
+            let routines = getSavedRoutines();
+
+            const existingIndex = routines.findIndex(r => r.name === routineName);
+            if (existingIndex >= 0) {
+                routines[existingIndex] = {
+                    name: routineName,
+                    exercises: exercises,
+                    progressionMode: progressionMode,
+                    weightIncrement: weightIncrement
+                };
+            } else {
+                routines.push({
+                    name: routineName,
+                    exercises: exercises,
+                    progressionMode: progressionMode,
+                    weightIncrement: weightIncrement
+                });
+            }
+
+            try {
+                localStorage.setItem("savedRoutines", JSON.stringify(routines));
+                localStorage.setItem("lastRoutine", routineName);
+            } catch (e) {
+                console.error("Error saving routine:", e);
+            }
+        }
+
+        // ===== END LOCAL STORAGE FUNCTIONS =====
 
     </script>
 </body>

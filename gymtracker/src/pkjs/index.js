@@ -142,5 +142,56 @@ Pebble.addEventListener('appmessage', function(e) {
       syncedRoutines[routineName] = syncString;
       localStorage.setItem('synced_routines', JSON.stringify(syncedRoutines));
       console.log("Two-Way Sync Saved for: " + routineName);
+
+      // Auto-sync: If enabled, also update saved routine locally
+      var autoSyncEnabled = localStorage.getItem('autoSyncEnabled') === 'true';
+      if (autoSyncEnabled) {
+          var parts = syncString.split('|');
+          var exercises = [];
+          var startIndex = 1;
+
+          // Parse progression settings if present
+          var progressionMode = "2";
+          var weightIncrement = "2.5";
+          if (parts[1] === "-1" || parts[1] === "0" || parts[1] === "1") {
+              progressionMode = parts[1];
+              weightIncrement = parts[2];
+              startIndex = 3;
+          }
+
+          // Parse exercises
+          for (var i = startIndex; i < parts.length; i += 6) {
+              if (parts[i]) {
+                  exercises.push([
+                      parts[i],
+                      parseInt(parts[i + 1]),
+                      parseInt(parts[i + 2]),
+                      parseInt(parts[i + 3]),
+                      parseInt(parts[i + 4]),
+                      parts[i + 5] === "-" ? "" : parts[i + 5]
+                  ]);
+              }
+          }
+
+          // Update saved routines
+          var savedRoutines = JSON.parse(localStorage.getItem('savedRoutines') || '[]');
+          var existingIndex = savedRoutines.findIndex(function(r) { return r.name === routineName; });
+          var routineData = {
+              name: routineName,
+              exercises: exercises,
+              progressionMode: progressionMode,
+              weightIncrement: weightIncrement
+          };
+
+          if (existingIndex >= 0) {
+              savedRoutines[existingIndex] = routineData;
+          } else {
+              savedRoutines.push(routineData);
+          }
+
+          localStorage.setItem('savedRoutines', JSON.stringify(savedRoutines));
+          localStorage.setItem('lastRoutine', routineName);
+          console.log("Auto-synced routine updated: " + routineName);
+      }
   }
 });
