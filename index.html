@@ -75,9 +75,17 @@
             <div class="flex-row">
                 <select id="savedRoutineSelect" onchange="selectRoutine()" style="margin: 0; flex: 1;">
                     <option value="">-- New Routine --</option>
-                </select>
+</select>
                 <button type="button" class="small-btn delete-btn" onclick="deleteRoutine()" style="margin: 0; white-space: nowrap;">Delete</button>
             </div>
+        </div>
+
+        <div class="card">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="autoSyncCheckbox" style="margin-right: 8px;" onchange="saveAutoSyncPreference()">
+                Auto-sync progressions
+            </label>
+            <p style="font-size: 11px; color: #666; margin: 5px 0 0 0;">Automatically update routine after watch workout completes.</p>
         </div>
 
         <div class="card">

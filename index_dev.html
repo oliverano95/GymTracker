@@ -68,7 +68,6 @@
 
     <div class="tab-container">
         <button class="tab-btn active" onclick="switchTab(event, 'tab-builder')">🏋️ Builder</button>
-        <button class="tab-btn" onclick="switchTab(event, 'tab-batch')">📦 Batch</button>
         <button class="tab-btn" onclick="switchTab(event, 'tab-history')">📜 History</button>
         <button class="tab-btn" onclick="switchTab(event, 'tab-cloud')">☁️ Cloud Sync</button>
     </div>
@@ -162,25 +161,6 @@
             <div id="progressionDesc" class="modifier-desc" style="margin-top: 15px;">
                 Progression is disabled. Your targets will remain exactly as you set them.
             </div>
-        </div>
-    </div>
-
-    <div id="tab-batch" class="tab-content">
-        <div class="card">
-            <h3 style="margin-top: 0;">Batch Routine Queue</h3>
-            <p style="font-size: 12px; color: gray; margin-top: 0;">Prepare multiple routines in the Builder and add them here to send them to the watch all at once.</p>
-            
-            <button type="button" class="small-btn batch-btn" style="margin-top: 10px; margin-bottom: 15px;" onclick="document.getElementById('batchFile').click()">📂 Load Multiple Files into Batch</button>
-            <input type="file" id="batchFile" accept=".json" multiple style="display: none;" onchange="batchImport(event)">
-
-            <div style="background: #fafafa; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 15px; padding: 10px;">
-                <h4 id="batchCount" style="margin-top: 0; text-align: center; color: #17a2b8;">0 / 7 Routines Prepared</h4>
-                <div id="batchList">
-                    <p style="color: gray; font-size: 12px; text-align: center;">No routines in the batch yet. Build a routine and click "Add to Batch".</p>
-                </div>
-            </div>
-
-            <button onclick="sendBatchToPebble()" style="padding: 15px; font-size: 18px; width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.2);">🚀 Send Entire Batch to Watch</button>
         </div>
     </div>
     
@@ -278,9 +258,6 @@
             if (tabId === 'tab-builder') {
                 btnAddBatch.style.display = "block";
                 btnSendSingle.style.display = "block";
-            } else if (tabId === 'tab-batch') {
-                btnAddBatch.style.display = "none";
-                btnSendSingle.style.display = "none";
             } else {
                 btnAddBatch.style.display = "none";
                 btnSendSingle.style.display = "block"; // Keep visible on History/Cloud to push settings
