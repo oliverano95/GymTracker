@@ -69,13 +69,16 @@
         <button class="tab-btn" onclick="switchTab(event, 'tab-cloud')">☁️ Cloud Sync</button>
     </div>
 
-    <div id="tab-builder" class="tab-content active">
+<div id="tab-builder" class="tab-content active">
         <div class="card">
-            <h3 style="margin-top: 0;">Manage Routine Files</h3>
+            <label>Saved Routines:</label>
             <div class="flex-row">
-                <button class="secondary-btn" onclick="document.getElementById('importFile').click()">Load (File)</button>
-                <button class="secondary-btn" onclick="exportJSON()">Save (File)</button>
+                <select id="savedRoutineSelect" onchange="selectRoutine()" style="margin: 0; flex: 1;">
+                    <option value="">-- New Routine --</option>
+                </select>
+                <button type="button" class="small-btn delete-btn" onclick="deleteRoutine()" style="margin: 0; white-space: nowrap;">Delete</button>
             </div>
+        </div>
             <input type="file" id="importFile" accept=".json" style="display: none;" onchange="importJSON(event)">
             
             <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
@@ -197,6 +200,16 @@
                 <button type="button" class="small-btn secondary-btn" style="margin: 0; flex: 1;" onclick="copyText()">2. Copy Text</button>
             </div>
             <button type="button" class="small-btn" style="margin: 10px 0 0 0; width: 100%; background-color: #28a745;" onclick="importFromText()">Import Pasted Text</button>
+        </div>
+
+        <div class="card">
+            <h3 style="margin-top: 0;">Manage Routine Files</h3>
+            <p style="font-size: 12px; color: gray; margin-top: 0;">Load or save routines to/from JSON files.</p>
+            <div class="flex-row">
+                <button class="secondary-btn" onclick="document.getElementById('importFile').click()">Load (File)</button>
+                <button class="secondary-btn" onclick="exportJSON()">Save (File)</button>
+            </div>
+            <input type="file" id="importFile" accept=".json" style="display: none;" onchange="importJSON(event)">
         </div>
 
         <div class="card">
