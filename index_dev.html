@@ -210,7 +210,6 @@
     </div>
 
     <div style="margin-bottom: 40px;">
-        <button id="btn-add-batch" class="batch-btn" onclick="addToBatch()">📦 + Add Current Routine to Batch</button>
         <button id="btn-send-single" onclick="saveAndPush()" style="padding: 15px; font-size: 18px; width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.2);">Save & Push to Watch</button>
     </div>
 
@@ -252,14 +251,11 @@
             evt.currentTarget.classList.add("active");
 
             // Button Visibility Logic
-            const btnAddBatch = document.getElementById("btn-add-batch");
             const btnSendSingle = document.getElementById("btn-send-single");
 
             if (tabId === 'tab-builder') {
-                btnAddBatch.style.display = "block";
                 btnSendSingle.style.display = "block";
             } else {
-                btnAddBatch.style.display = "none";
                 btnSendSingle.style.display = "block"; // Keep visible on History/Cloud to push settings
             }
         }
@@ -378,7 +374,6 @@
             loadSavedRoutines();
             
             // Set initial button visibility explicitly
-            document.getElementById("btn-add-batch").style.display = "block";
             document.getElementById("btn-send-single").style.display = "block";
             
             const storedUrl = getQueryParam('googleUrl', '');
