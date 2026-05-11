@@ -1879,12 +1879,14 @@ static void mega_window_unload(Window *window) {
 
 static void wo_up_click(ClickRecognizerRef recognizer, void *context) {
   if (s_is_resting) return; 
+  if (s_is_timed_active) return;
   if (s_edit_mode == 0) s_temp_reps++; else s_temp_weight++;
   update_workout_ui(false);
 }
 
 static void wo_down_click(ClickRecognizerRef recognizer, void *context) {
   if (s_is_resting) return;
+  if (s_is_timed_active) return;
   if (s_edit_mode == 0 && s_temp_reps > 0) s_temp_reps--; 
   else if (s_edit_mode == 1 && s_temp_weight > 0) s_temp_weight--;
   update_workout_ui(false);
