@@ -1429,12 +1429,14 @@ static void init_temp_values(Exercise *ex) {
   } else {
     s_temp_reps = ex->target_reps;
     if (ex->modifier == 1 && (ex->current_set % 2 == 0) && ex->target_weight == 0) {
+      s_temp_reps = ex->actual_reps[ex->current_set - 2];
       s_temp_reps = (s_temp_reps * (100 - s_drop_set_pct)) / 100;
     }
   }
 
   int active_weight = ex->target_weight;
   if (ex->modifier == 1 && (ex->current_set % 2 == 0) && ex->target_weight != 0) {
+      active_weight = ex->actual_weight[ex->current_set - 2];
       active_weight = (active_weight * (100 - s_drop_set_pct)) / 100;
   }
   s_temp_weight = active_weight;
