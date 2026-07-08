@@ -2754,8 +2754,6 @@ static void set_rest_overlay_state(bool is_resting, bool animated) {
   GRect bounds   = layer_get_bounds(w_layer);
   int rest_box_height = s_app.geom.line2_y - s_app.geom.line1_y;
 
-  if (is_resting) hide_note_toast(false);  // mutual exclusion with note toast
-
   GRect on_screen  = GRect(0, s_app.geom.line1_y, bounds.size.w, rest_box_height);
   GRect off_screen = GRect(0, bounds.size.h,       bounds.size.w, rest_box_height);
   GRect target_rect = is_resting ? on_screen : off_screen;
