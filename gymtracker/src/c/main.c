@@ -174,7 +174,6 @@ typedef struct {
   Animation *rest_anim;
   Animation *note_toast_anim;
 
-  AppTimer *note_toast_dismiss_timer;
   AppTimer *note_toast_scroll_timer;
   char note_toast_text[32];
   int16_t note_toast_text_width;
@@ -280,7 +279,6 @@ static void init_temp_values(Exercise *ex);
 
 static void show_note_toast(void);
 static void hide_note_toast(bool animated);
-static void note_toast_dismiss_cb(void *ctx);
 static void note_toast_scroll_cb(void *ctx);
 static void note_toast_text_update_proc(Layer *layer, GContext *ctx);
 static void note_toast_bg_update_proc(Layer *layer, GContext *ctx);
@@ -2569,16 +2567,10 @@ static void note_toast_scroll_cb(void *ctx) {
   s_app.ui.note_toast_scroll_timer = app_timer_register(NOTE_TOAST_SCROLL_MS, note_toast_scroll_cb, NULL);
 }
 
-static void note_toast_dismiss_cb(void *ctx) {
-  s_app.ui.note_toast_dismiss_timer = NULL;
-  hide_note_toast(true);
-}
-
 static void show_note_toast(void) {
   if (!s_app.ui.workout_window) return;
   if (!s_app.ui.note_toast_layer) return;  // created in workout_window_load
   if (s_app.state.curr_ex_idx >= s_app.state.total_exercises) return;
-  if (s_app.state.is_resting) return;
 
   Exercise *ex = &s_app.state.exercises[s_app.state.curr_ex_idx];
   if (ex->comment[0] == '\0') {
@@ -2603,11 +2595,7 @@ static void show_note_toast(void) {
     animation_unschedule(s_app.ui.note_toast_anim);
     s_app.ui.note_toast_anim = NULL;
   }
-  // Cancel timers from any prior toast
-  if (s_app.ui.note_toast_dismiss_timer) {
-    app_timer_cancel(s_app.ui.note_toast_dismiss_timer);
-    s_app.ui.note_toast_dismiss_timer = NULL;
-  }
+  // Cancel any scroll timer from a prior toast
   if (s_app.ui.note_toast_scroll_timer) {
     app_timer_cancel(s_app.ui.note_toast_scroll_timer);
     s_app.ui.note_toast_scroll_timer = NULL;
@@ -2632,9 +2620,9 @@ static void show_note_toast(void) {
     (AnimationHandlers){ .stopped = note_toast_anim_stopped_handler }, NULL);
   animation_schedule(s_app.ui.note_toast_anim);
 
-  // Schedule auto-dismiss
-  s_app.ui.note_toast_dismiss_timer =
-    app_timer_register(NOTE_TOAST_DISMISS_MS, note_toast_dismiss_cb, NULL);
+  // No auto-dismiss: the toast now stays visible for the duration of the
+  // current exercise's sets and rests. It is hidden/refreshed only when
+  // update_workout_ui detects an exercise change.
 
   // Schedule scroll if text is wider than visible area
   int16_t visible_w = layer_get_bounds(s_app.ui.note_toast_text_layer).size.w;
@@ -2653,10 +2641,6 @@ static void hide_note_toast(bool animated) {
     return;
   }
 
-  if (s_app.ui.note_toast_dismiss_timer) {
-    app_timer_cancel(s_app.ui.note_toast_dismiss_timer);
-    s_app.ui.note_toast_dismiss_timer = NULL;
-  }
   if (s_app.ui.note_toast_scroll_timer) {
     app_timer_cancel(s_app.ui.note_toast_scroll_timer);
     s_app.ui.note_toast_scroll_timer = NULL;
@@ -2956,9 +2940,10 @@ static void update_workout_ui(bool animate_box) {
 
   animate_highlight_box(animate_box);
 
-  // Show note toast on exercise change (suppressed while resting so the toast
-  // waits until the rest ends - the next update_workout_ui will pick it up)
-  if (!s_app.state.is_resting && s_app.state.curr_ex_idx != s_app.state.note_toast_prev_ex_idx) {
+  // Show/update note toast on exercise change. Toast stays visible across
+  // sets and rests for the current exercise; an exercise with no note is
+  // hidden via the empty-comment early-out inside show_note_toast().
+  if (s_app.state.curr_ex_idx != s_app.state.note_toast_prev_ex_idx) {
     s_app.state.note_toast_prev_ex_idx = s_app.state.curr_ex_idx;
     show_note_toast();
   }
@@ -3228,7 +3213,6 @@ static void workout_window_load(Window *window) {
   s_app.ui.note_toast_text_width = 0;
   s_app.ui.note_toast_scroll_offset = NOTE_TOAST_TEXT_PADDING;
   s_app.ui.note_toast_scroll_pause_until = 0;
-  s_app.ui.note_toast_dismiss_timer = NULL;
   s_app.ui.note_toast_scroll_timer = NULL;
   s_app.ui.note_toast_anim = NULL;
   s_app.ui.note_toast_visible = false;
@@ -3277,7 +3261,6 @@ static void workout_window_unload(Window *window) {
   if (s_app.ui.box_anim)  { animation_unschedule(s_app.ui.box_anim);  s_app.ui.box_anim  = NULL; }
   if (s_app.ui.rest_anim) { animation_unschedule(s_app.ui.rest_anim); s_app.ui.rest_anim = NULL; }
   if (s_app.ui.note_toast_anim) { animation_unschedule(s_app.ui.note_toast_anim); s_app.ui.note_toast_anim = NULL; }
-  if (s_app.ui.note_toast_dismiss_timer) { app_timer_cancel(s_app.ui.note_toast_dismiss_timer); s_app.ui.note_toast_dismiss_timer = NULL; }
   if (s_app.ui.note_toast_scroll_timer)   { app_timer_cancel(s_app.ui.note_toast_scroll_timer);   s_app.ui.note_toast_scroll_timer   = NULL; }
 
   layer_destroy(s_app.ui.progress_layer);
