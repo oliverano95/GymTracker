@@ -248,9 +248,23 @@ Pebble.addEventListener('webviewclosed', function(e) {
   }
 
   // --- Two-Way Sync routines ---
-  if (configData.updatedSync !== undefined) {
-    Storage.setJSON('synced_routines', configData.updatedSync);
+  var synced = Storage.getJSON('synced_routines', {});
+
+  // 1. Purge deleted keys
+  if (Array.isArray(configData.deletedKeys)) {
+    configData.deletedKeys.forEach(function(key) {
+      delete synced[key];
+    });
   }
+
+  // 2. Apply updated/renamed keys
+  if (configData.updatedSync) {
+    Object.keys(configData.updatedSync).forEach(function(key) {
+      synced[key] = configData.updatedSync[key];
+    });
+  }
+
+  Storage.setJSON('synced_routines', synced);
 
   // --- Send data to watch ---
   var appMessageData = {};
