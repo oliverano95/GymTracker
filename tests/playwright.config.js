@@ -4,7 +4,7 @@ const path = require('path');
 
 module.exports = defineConfig({
   testDir: '.',
-  testMatch: ['test-config-page.js', 'emulator.js'],
+  testMatch: ['test-config-page.js', 'emulator.js', 'test-csv-export.js', 'test-e2e.js'],
   timeout: 60_000,
   expect: { timeout: 5_000 },
   fullyParallel: false,

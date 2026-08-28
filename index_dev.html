@@ -307,6 +307,7 @@
         <input type="text"     id="googleUrlInput" placeholder="https://script.google.com/macros/s/.../exec">
         <label>Export Password:</label>
         <input type="password" id="googlePwdInput" placeholder="Your secret password">
+        <button type="button" onclick="exportRoutinesToCSV()" style="width:100%; padding:12px; margin-top:12px; background:var(--green); color:white; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer;">Export Routines to CSV</button>
     </div>
 </div>
 
@@ -1113,6 +1114,64 @@ function routineMatchesSyncedCopy(name) {
         if ((a.length > 5 ? String(a[5]) : '') !== String(b[5] || '')) return false;
     }
     return true;
+}
+
+// ============================================================
+// MANUAL ROUTINE EXPORT  (CSV backup)
+// ============================================================
+function getAllRoutineDefinitions() {
+    const routines = getSavedRoutines();
+    const definitions = {};
+    const deleted = Storage.getJSON('deletedSyncKeys', []);
+
+    routines.forEach(r => {
+        if (deleted.includes(r.name)) return;
+        const parts = [r.name, r.progressionMode || '-1', r.weightIncrement || '2'];
+        (r.exercises || []).forEach(ex => {
+            parts.push(ex.map(v => v === undefined || v === null ? '' : v).join(':'));
+        });
+        definitions[r.name] = parts.join('|');
+    });
+
+    return definitions;
+}
+
+function exportRoutinesToCSV() {
+    const googleUrl = document.getElementById('googleUrlInput').value;
+    const googlePwd = document.getElementById('googlePwdInput').value;
+
+    if (!googleUrl || !googleUrl.trim()) {
+        alert('Please enter a Google Script URL first.');
+        return;
+    }
+    if (!googlePwd || !googlePwd.trim()) {
+        alert('Please enter an export password first.');
+        return;
+    }
+
+    const definitions = getAllRoutineDefinitions();
+    if (Object.keys(definitions).length === 0) {
+        alert('No routines to export.');
+        return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', googleUrl, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            alert('Routines exported successfully!');
+        } else {
+            alert('Export failed: ' + xhr.status);
+        }
+    };
+    xhr.onerror = function() {
+        alert('Network error. Check the URL.');
+    };
+    xhr.send(JSON.stringify({
+        token: googlePwd,
+        routineDefinitions: definitions
+    }));
 }
 
 // ============================================================
