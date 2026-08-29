@@ -159,6 +159,7 @@
                 <option value="">-- New Routine --</option>
             </select>
             <button type="button" class="small-btn delete-btn" onclick="deleteRoutine()" style="margin:0; white-space:nowrap;">Delete</button>
+            <button type="button" class="small-btn delete-btn" onclick="deleteAllRoutines()" style="margin:0; white-space:nowrap;">Delete All</button>
         </div>
     </div>
 
@@ -542,7 +543,7 @@ function selectRoutine() {
 
 function deleteRoutine() {
     const name = document.getElementById('savedRoutineSelect').value;
-    if (!name || !confirm(`Delete '${name}' from saved routines?`)) return;
+    if (!name || !confirm(`Delete '${name}'?\n\nSettings will close to save the change.`)) return;
 
     let routines = getSavedRoutines().filter(r => r.name !== name);
     Storage.setJSON('savedRoutines', routines);
@@ -554,16 +555,26 @@ function deleteRoutine() {
     if (!deletedKeys.includes(name)) {
         deletedKeys.push(name);
     }
-    Storage.setJSON('deletedSyncKeys', deletedKeys);
 
-    selectedRoutineOriginalName = null;
-    document.getElementById('routineName').value     = '';
-    document.getElementById('progressionMode').value = '-1';
-    document.getElementById('weightIncrement').value = '2';
-    myRoutine = [];
-    renderRoutine();
-    updateProgressionUI();
-    loadSavedRoutines();
+    // Immediately send deletion to pkjs — beforeunload/pagehide don't fire
+    // reliably on the Pebble companion app's WebView, so we can't wait.
+    sendToPebble({ deletedKeys: deletedKeys });
+}
+
+function deleteAllRoutines() {
+    const saved = getSavedRoutines();
+    if (saved.length === 0) return alert('No routines to delete.');
+    if (!confirm(`Delete ALL ${saved.length} routines?\n\nSettings will close to save the change.`)) return;
+
+    // Mark every synced routine as deleted
+    for (const name of Object.keys(syncedRoutinesDict)) {
+        if (!deletedKeys.includes(name)) deletedKeys.push(name);
+    }
+
+    Storage.setJSON('savedRoutines', []);
+    Storage.remove('lastRoutine');
+
+    sendToPebble({ deletedKeys: deletedKeys });
 }
 
 // ============================================================

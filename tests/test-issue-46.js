@@ -104,20 +104,19 @@ test.describe('Layer 1 — Config page logic', () => {
       savedRoutines: [{ name: 'A', exercises: [['Bench Press', 3, 10, 60, 0, '-']], progressionMode: '-1', weightIncrement: '2' }]
     });
 
+    // Mock sendToPebble to capture payload instead of navigating
+    await page.evaluate(() => {
+      window.__capturedPayload = null;
+      window.sendToPebble = (data) => { window.__capturedPayload = data; };
+    });
+
     await page.selectOption('#savedRoutineSelect', 'A');
     await page.click('.delete-btn');
 
-    const ls1 = await getLocalStorage(page);
-    expect(ls1.deletedSyncKeys).toContain('A');
-    expect(ls1.savedRoutines.find(r => r.name === 'A')).toBeUndefined();
-
-    await page.goto(`${BASE_URL}/index_dev.html?sync=${encodeURIComponent(JSON.stringify(syncDict))}`);
-    await waitForInit(page);
-
-    const options = await page.evaluate(() =>
-      Array.from(document.getElementById('savedRoutineSelect').options).map(o => o.value).filter(Boolean)
-    );
-    expect(options).not.toContain('A');
+    // deleteRoutine now sends directly to pkjs — check the captured payload
+    const payload = await page.evaluate(() => window.__capturedPayload);
+    expect(payload).not.toBeNull();
+    expect(payload.deletedKeys).toContain('A');
   });
 
   test('Test 2: Rename persists across reload', async ({ page }) => {
@@ -233,32 +232,27 @@ test.describe('Layer 1 — Config page logic', () => {
     expect(payloadSize).toBeLessThan(450);
   });
 
-  test('Test 11: beforeunload sends deletedKeys to pkjs (prevents resurrection)', async ({ page }) => {
-    // Regression: deleting a routine and reloading WITHOUT Save & Send used to
-    // leave the watch-side synced_routines unchanged, so pkjs would re-seed the
-    // deleted routine on next config open. The fix: beforeunload handler sends
-    // deletedKeys to pkjs on every close, ensuring the watch-side persistent
-    // tombstone is updated even without explicit Save & Send.
+  test('Test 11: deleteRoutine sends deletedKeys to pkjs (prevents resurrection)', async ({ page }) => {
+    // Regression: deleting a routine used to rely on beforeunload/pagehide to
+    // send deletedKeys to pkjs, which doesn't fire on the Pebble companion app.
+    // Fix: deleteRoutine now calls sendToPebble immediately with deletedKeys.
     await openWithSeed(page, {
       syncDict: { A: 'A|-1|2|Bench|3|10|60|0|-' },
       savedRoutines: [{ name: 'A', exercises: [['Bench Press', 3, 10, 60, 0, '-']], progressionMode: '-1', weightIncrement: '2' }]
     });
 
+    // Mock sendToPebble to capture payload
+    await page.evaluate(() => {
+      window.__capturedPayload = null;
+      window.sendToPebble = (data) => { window.__capturedPayload = data; };
+    });
+
     await page.selectOption('#savedRoutineSelect', 'A');
     await page.click('.delete-btn');
 
-    // Verify deletedKeys is populated in localStorage
-    const ls = await getLocalStorage(page);
-    expect(ls.deletedSyncKeys).toContain('A');
-
-    // Verify the beforeunload handler is wired up and would send deletedKeys
-    const hasHandler = await page.evaluate(() => {
-      // Check that the beforeunload listener exists and the payload would contain deletedKeys
-      const payload = {};
-      if (deletedKeys.length > 0) payload.deletedKeys = deletedKeys;
-      return payload.deletedKeys && payload.deletedKeys.length > 0;
-    });
-    expect(hasHandler).toBe(true);
+    const payload = await page.evaluate(() => window.__capturedPayload);
+    expect(payload).not.toBeNull();
+    expect(payload.deletedKeys).toContain('A');
   });
 });
 
@@ -297,7 +291,7 @@ test.describe('Layer 2 — Full stack with emulator', () => {
     expect(payload.updatedSync).toHaveProperty('B');
   });
 
-  test('Test 9: index_dev sends deletedKeys', async ({ page }) => {
+  test('Test 9: deleteRoutine sends only deletedKeys (not full dict)', async ({ page }) => {
     const syncDict = { A: 'A|-1|2|Bench|3|10|60|0|-|-', B: 'B|-1|2|Squat|3|10|80|0|-|-' };
     await openWithSeed(page, {
       syncDict,
@@ -307,14 +301,102 @@ test.describe('Layer 2 — Full stack with emulator', () => {
       ]
     });
 
+    // Mock sendToPebble to capture payload
+    await page.evaluate(() => {
+      window.__capturedPayload = null;
+      window.sendToPebble = (data) => { window.__capturedPayload = data; };
+    });
+
     await page.selectOption('#savedRoutineSelect', 'A');
     await page.click('.delete-btn');
 
-    const payload = await saveWithoutNav(page);
+    const payload = await page.evaluate(() => window.__capturedPayload);
     expect(payload.deletedKeys).toEqual(['A']);
     expect(payload.updatedSync?.A).toBeUndefined();
-    // Must NOT send full syncedRoutinesDict — only the delta
-    const fullDictKey = Object.keys(syncDict).every(k => payload.updatedSync && k in payload.updatedSync);
-    expect(fullDictKey).toBe(false);
+  });
+
+  // =====================================================================
+  // LAYER 3 — deleteRoutine / deleteAllRoutines immediate persistence
+  // =====================================================================
+  test('Test 24: deleteRoutine sends deletions to pkjs immediately', async ({ page }) => {
+    // deleteRoutine must call sendToPebble with deletedKeys instead of relying
+    // on beforeunload/pagehide (which don't fire on Pebble companion app).
+    await openWithSeed(page, {
+      syncDict: { A: 'A|-1|2|Bench|3|10|60|0|-|-' },
+      savedRoutines: [{ name: 'A', exercises: [['Bench Press', 3, 10, 60, 0, '-']], progressionMode: '-1', weightIncrement: '2' }]
+    });
+
+    await page.evaluate(() => {
+      window.__capturedPayload = null;
+      window.sendToPebble = (data) => { window.__capturedPayload = data; };
+    });
+
+    await page.selectOption('#savedRoutineSelect', 'A');
+    await page.click('.delete-btn');
+
+    const payload = await page.evaluate(() => window.__capturedPayload);
+    expect(payload).not.toBeNull();
+    expect(payload.deletedKeys).toContain('A');
+  });
+
+  test('Test 25: deleteAllRoutines marks all synced routines as deleted', async ({ page }) => {
+    const syncDict = {
+      A: 'A|-1|2|Bench|3|10|60|0|-|-',
+      B: 'B|-1|2|Squat|3|10|80|0|-|-',
+      C: 'C|-1|2|Deadlift|3|8|100|0|-|-',
+    };
+    await openWithSeed(page, {
+      syncDict,
+      savedRoutines: [
+        { name: 'A', exercises: [['Bench', 3, 10, 60, 0, '-']], progressionMode: '-1', weightIncrement: '2' },
+        { name: 'B', exercises: [['Squat', 3, 10, 80, 0, '-']], progressionMode: '-1', weightIncrement: '2' },
+        { name: 'C', exercises: [['Deadlift', 3, 8, 100, 0, '-']], progressionMode: '-1', weightIncrement: '2' },
+      ]
+    });
+
+    await page.evaluate(() => {
+      window.__capturedPayload = null;
+      window.sendToPebble = (data) => { window.__capturedPayload = data; };
+    });
+
+    await page.click('button:text("Delete All")');
+
+    const payload = await page.evaluate(() => window.__capturedPayload);
+    expect(payload).not.toBeNull();
+    expect(payload.deletedKeys).toEqual(expect.arrayContaining(['A', 'B', 'C']));
+    expect(payload.deletedKeys.length).toBe(3);
+  });
+
+  test('Test 26: deleteAllRoutines does nothing when no routines exist', async ({ page }) => {
+    await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
+
+    await page.evaluate(() => {
+      window.__capturedPayload = null;
+      window.sendToPebble = (data) => { window.__capturedPayload = data; };
+    });
+
+    await page.evaluate(() => deleteAllRoutines());
+
+    const payload = await page.evaluate(() => window.__capturedPayload);
+    expect(payload).toBeNull();
+  });
+
+  test('Test 30: deleteRoutine confirmation includes close warning', async ({ page }) => {
+    await openWithSeed(page, {
+      syncDict: { A: 'A|-1|2|Bench|3|10|60|0|-|-' },
+      savedRoutines: [{ name: 'A', exercises: [['Bench', 3, 10, 60, 0, '-']], progressionMode: '-1', weightIncrement: '2' }]
+    });
+
+    const confirmMsg = await page.evaluate(() => {
+      document.getElementById('savedRoutineSelect').value = 'A';
+      let msg = '';
+      const origConfirm = window.confirm;
+      window.confirm = (m) => { msg = m; return false; };
+      deleteRoutine();
+      window.confirm = origConfirm;
+      return msg;
+    });
+
+    expect(confirmMsg).toContain('close');
   });
 });
