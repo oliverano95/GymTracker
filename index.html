@@ -1062,8 +1062,27 @@ function sendToPebble(configData) {
     window.location.href = returnTo + encoded;
 }
 
-function sendRawToPebble(syncString) {
+function sendRawToPebble(syncString, deletions, modifiedRoutines) {
+    _hasNavigated = true;
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
+
+    // When there are pending deletions (or modifications), send as JSON so
+    // pkjs processes deletedKeys via the webviewclosed JSON path
+    // (handleRawSyncString does not handle tombstones). The raw sync string
+    // goes in routineData so pkjs still routes it through handleRawSyncString
+    // for chunked transfer.
+    if (deletions && deletions.length > 0) {
+        const payload = {
+            deletedKeys: deletions,
+            routineData: syncString
+        };
+        if (modifiedRoutines) payload.updatedSync = modifiedRoutines;
+        const encoded = encodeURIComponent(JSON.stringify(payload));
+        console.log('sendRawToPebble: sending JSON with deletions (' + encoded.length + ' chars)');
+        window.location.href = returnTo + encoded;
+        return;
+    }
+
     const encoded  = encodeURIComponent(syncString);
     console.log('sendRawToPebble: encoded.length=' + encoded.length + ' (routines are split into chunks by pkjs when needed)');
     if (encoded.length > MAX_CONFIG_RESPONSE) {
@@ -1180,7 +1199,8 @@ function saveAndSendSingle() {
     // double-navigation). clear flags are rare, deliberate actions handled
     // by their own buttons; if a routine is also pending, the routine wins.
     if (routineStr) {
-        sendRawToPebble(routineStr);
+        sendRawToPebble(routineStr, deletedKeys,
+            Object.keys(modifiedRoutines).length > 0 ? modifiedRoutines : null);
     } else if (Object.keys(payload).length > 0) {
         sendToPebble(payload);
     }
@@ -1247,7 +1267,8 @@ function sendBatchToPebble() {
         `Any routines already on the watch that are not in this batch will be removed.`;
     if (!window.confirm(confirmMsg)) return;
     const finalStr = 'BATCH~' + batchRoutines.map(r => r.dataStr).join('~');
-    sendRawToPebble(finalStr);
+    sendRawToPebble(finalStr, deletedKeys,
+        Object.keys(modifiedRoutines).length > 0 ? modifiedRoutines : null);
 }
 
 // ============================================================
