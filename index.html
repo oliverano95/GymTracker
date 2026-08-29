@@ -1015,7 +1015,9 @@ function validateRoutineForSend(name) {
 }
 
 function serialiseRoutine(name, exercises) {
-    let s = name;
+    const progMode = document.getElementById('progressionMode').value;
+    const weightInc = document.getElementById('weightIncrement').value;
+    let s = `${name}|${progMode}|${weightInc}`;
     exercises.forEach(ex => {
         const mod = ex.length > 4 ? ex[4] : 0;
         const cmt = (ex.length > 5 && ex[5].trim() !== '') ? ex[5].trim() : '-';
@@ -1054,6 +1056,15 @@ function sendToPebble(configData) {
     if (encoded.length > MAX_CONFIG_RESPONSE) {
         alert(`⚠️ Settings payload is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer (longer responses are silently dropped and never reach the watch). Please shorten exercise names/comments or split the routine.`);
         return;
+    }
+    window.location.href = returnTo + encoded;
+}
+
+function sendRawToPebble(syncString) {
+    const returnTo = getQueryParam('return_to', 'pebblejs://close#');
+    const encoded  = encodeURIComponent(syncString);
+    if (encoded.length > MAX_CONFIG_RESPONSE) {
+        alert(`⚠️ Routine is ${encoded.length} encoded chars — over the ${MAX_CONFIG_RESPONSE}-char limit. The watch will receive it in chunks automatically. Continuing...`);
     }
     window.location.href = returnTo + encoded;
 }
@@ -1129,23 +1140,37 @@ function saveAndSendSingle() {
         return;
     }
 
-    // If the routine is unchanged from the watch's last synced copy, send
-    // only the progression settings (tiny payload, always fits the transfer
-    // limit). Only re-transmit the full routine when it actually changed.
-    let routineStr = '';
-    if (myRoutine.length > 0 && !routineMatchesSyncedCopy(name)) {
-        routineStr = serialiseRoutine(name, myRoutine);
-        if (routineStr.length > MAX_ROUTINE_LEN) {
-            alert('⚠️ Routine too long! Please abbreviate some exercise names and try again.');
-            return;
-        }
-    }
-
     saveRoutineToStorage(name, myRoutine,
         document.getElementById('progressionMode').value,
         document.getElementById('weightIncrement').value);
     loadSavedRoutines();
-    sendToPebble(buildConfigPayload(routineStr));
+
+    let routineStr = '';
+    if (myRoutine.length > 0) {
+        if (routineMatchesSyncedCopy(name)) {
+            const progMode = document.getElementById('progressionMode').value;
+            const weightInc = document.getElementById('weightIncrement').value;
+            routineStr = `${name}|${progMode}|${weightInc}`;
+        } else {
+            routineStr = serialiseRoutine(name, myRoutine);
+        }
+    }
+
+    const payload = {};
+    const googleUrl = document.getElementById('googleUrlInput').value;
+    const googlePwd = document.getElementById('googlePwdInput').value;
+    if (routineStr)          payload.routineData = routineStr;
+    if (googleUrl)           payload.googleUrl  = googleUrl;
+    if (googlePwd)           payload.googlePwd  = googlePwd;
+    if (shouldClearHistory)  payload.clearHistory = true;
+    if (shouldClearGoogle)   payload.clearGoogle  = true;
+
+    const hasOnlyRoutine = Object.keys(payload).length === 1 && payload.routineData;
+    if (hasOnlyRoutine) {
+        sendRawToPebble(routineStr);
+    } else if (Object.keys(payload).length > 0) {
+        sendToPebble(payload);
+    }
 }
 
 // ============================================================
@@ -1204,7 +1229,7 @@ function sendBatchToPebble() {
         alert('Your batch is empty! Add routines from the Builder first.'); return;
     }
     const finalStr = 'BATCH~' + batchRoutines.map(r => r.dataStr).join('~');
-    sendToPebble(buildConfigPayload(finalStr));
+    sendRawToPebble(finalStr);
 }
 
 // ============================================================

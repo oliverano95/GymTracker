@@ -6,6 +6,7 @@
 #define MAX_EXERCISES 15
 #define MAX_SLOTS 7
 #define EXPORT_BUF_SIZE 1024
+#define CHUNK_BUF_SIZE 2048
 
 #define STORAGE_KEY_BASE   100
 #define SETTINGS_KEY_BASE  200
@@ -3859,6 +3860,106 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
   if (weight_inc_tuple) {
     s_app.settings.weight_increment = weight_inc_tuple->value->int32;
     persist_write_int(SETTINGS_KEY_BASE + SK_WEIGHT_INC, s_app.settings.weight_increment);
+  }
+
+  // ----------- Handle chunked transfer (large routines) -----------
+  // Format: "N/T|data" where N=current chunk, T=total chunks
+  // pkjs splits oversized payloads into CHUNK_SIZE (400 char) chunks
+  // and sends them sequentially with this metadata header.
+  Tuple *chunk_tuple = dict_find(iterator, MESSAGE_KEY_CHUNK_TRANSFER);
+  if (chunk_tuple && chunk_tuple->type == TUPLE_CSTRING) {
+    static char chunk_buf[CHUNK_BUF_SIZE];
+    static int chunk_expected_total = 0;
+    static int chunk_received_count = 0;
+    static bool chunk_in_progress = false;
+
+    const char *raw = chunk_tuple->value->cstring;
+
+    // Parse "N/T|data"
+    int chunk_num = 0, chunk_total = 0;
+    const char *pipe = strchr(raw, '|');
+    if (pipe) {
+      // Manual parse of "N/T" — avoids sscanf which pulls in libc stubs
+      // unavailable on gabbro platform
+      const char *p = raw;
+      while (*p >= '0' && *p <= '9') { chunk_num = chunk_num * 10 + (*p - '0'); p++; }
+      if (*p == '/') {
+        p++;
+        while (*p >= '0' && *p <= '9') { chunk_total = chunk_total * 10 + (*p - '0'); p++; }
+      }
+      if (chunk_num > 0 && chunk_total > 0 && pipe[1] != '\0') {
+        const char *data = pipe + 1;
+        int data_len = strlen(data);
+
+        // First chunk: initialize buffer
+        if (chunk_num == 1) {
+          chunk_buf[0] = '\0';
+          chunk_expected_total = chunk_total;
+          chunk_received_count = 0;
+          chunk_in_progress = true;
+        }
+
+        if (chunk_in_progress && chunk_num == chunk_received_count + 1) {
+          // Append data to buffer
+          int cur_len = strlen(chunk_buf);
+          if (cur_len + data_len < CHUNK_BUF_SIZE - 1) {
+            memcpy(chunk_buf + cur_len, data, data_len);
+            chunk_buf[cur_len + data_len] = '\0';
+            chunk_received_count++;
+          } else {
+            // Buffer overflow — abort chunk transfer
+            chunk_in_progress = false;
+            chunk_buf[0] = '\0';
+          }
+        } else if (chunk_in_progress) {
+          // Out-of-order chunk — abort
+          chunk_in_progress = false;
+          chunk_buf[0] = '\0';
+        }
+
+        // All chunks received — process the complete routine
+        if (chunk_in_progress && chunk_received_count == chunk_expected_total) {
+          chunk_in_progress = false;
+
+          // Process as if it were a normal ROUTINE_DATA message
+          parse_routine_string(chunk_buf);
+
+          int target_slot = s_app.storage.active_slots;
+          bool slot_exists = false;
+
+          for (int i = 0; i < s_app.storage.active_slots; i++) {
+            if (strcmp(s_app.storage.slot_names[i], s_app.state.routine_name) == 0) {
+              target_slot = i;
+              slot_exists = true;
+              break;
+            }
+          }
+          if (target_slot > MAX_SLOTS - 1) target_slot = MAX_SLOTS - 1;
+
+          if (slot_exists) {
+            for (int i = 0; i < s_app.state.total_exercises; i++) {
+              for (int old_idx = 0; old_idx < s_app.storage.slot_counts[target_slot]; old_idx++) {
+                Exercise old_ex;
+                if (persist_read_data(ROUTINE_EX_BASE + (target_slot * MAX_EXERCISES) + old_idx, &old_ex, sizeof(Exercise)) > 0) {
+                  if (strcmp(s_app.state.exercises[i].name, old_ex.name) == 0) {
+                    for (int s = 0; s < 10; s++) {
+                      s_app.state.exercises[i].actual_reps[s] = old_ex.actual_reps[s];
+                      s_app.state.exercises[i].actual_weight[s] = old_ex.actual_weight[s];
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          save_routine_to_slot(target_slot);
+          refresh_directory();
+          menu_layer_reload_data(s_app.ui.menu_layer);
+          vibes_double_pulse();
+        }
+      }
+    }
   }
 
   // ----------- Catch single parsed voice exercise from phone -----------
