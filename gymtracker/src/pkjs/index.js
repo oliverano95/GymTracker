@@ -4,9 +4,9 @@
 // CONFIGURATION
 // ============================================================
 var CONFIG = {
-  isDevMode: true,
-  configUrlDev: 'http://192.168.1.111:8081/index_dev.html',
-  configUrlProd: 'http://192.168.1.111:8081/index.html',
+  isDevMode: false,
+  configUrlDev:  'https://oliverano95.github.io/GymTracker/index_dev.html',
+  configUrlProd: 'https://oliverano95.github.io/GymTracker/',
   maxHistory: 15
 };
 
