@@ -333,3 +333,81 @@ test.describe('Layer 1 — Raw sync string format', () => {
     console.log(`Hungarian 9-exercise routine (raw): ${encodedLength} encoded chars`);
   });
 });
+
+// =====================================================================
+// LAYER 2 — Import / add-all batch (Phase 4/5/6)
+// =====================================================================
+test.describe('Layer 2 — Import & add-all-to-batch', () => {
+  test('T9: serialiseRoutine uses explicit prog/inc when provided', async ({ page }) => {
+    await autoConfirm(page);
+    await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
+
+    const result = await page.evaluate(() => {
+      // DOM defaults to "Off" (-1)/"2", but explicit args must win
+      return serialiseRoutine('Push', [['Bench', 3, 10, 60, 0, '-']], '0', '2');
+    });
+
+    expect(result).toMatch(/^Push\|0\|2\|/);
+  });
+
+  test('T10: addAllToBatch skips corrupt/stale entries and uses routine\'s own prog/inc', async ({ page }) => {
+    await autoConfirm(page);
+    await openWithSeed(page, {
+      syncDict: {},
+      savedRoutines: [
+        { name: 'Push', exercises: [['Bench', 3, 10, 60, 0, '-']], progressionMode: '0', weightIncrement: '2' },
+        { name: '2', exercises: [] },
+        { name: '', exercises: [['Ghost', 3, 10, 40, 0, '-']] },
+        { name: 'Legs', exercises: [['Squat', 3, 10, 80, 0, '-']], progressionMode: '1', weightIncrement: '3' },
+      ]
+    });
+
+    await page.click('#btn-add-all-batch');
+
+    const batch = await page.evaluate(() => batchRoutines);
+    const names = batch.map(r => r.name);
+    expect(names).toContain('Push');
+    expect(names).toContain('Legs');
+    expect(names).not.toContain('2');
+    expect(names).not.toContain('');
+    expect(names.length).toBe(2);
+
+    const pushStr = batch.find(r => r.name === 'Push').dataStr;
+    expect(pushStr).toMatch(/^Push\|0\|2\|/);
+    const legsStr = batch.find(r => r.name === 'Legs').dataStr;
+    expect(legsStr).toMatch(/^Legs\|1\|3\|/);
+  });
+
+  test('T11: importFromText bulk sends BATCH via sendRawToPebble (no sendToPebble limit)', async ({ page }) => {
+    await autoConfirm(page);
+    await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
+
+    const importData = JSON.stringify([
+      { n: 'W1H', e: [['Bench', 3, 10, 60, 0, '-'], ['Row', 3, 10, 50, 0, '-']] },
+      { n: 'W1L', e: [['Squat', 3, 10, 80, 0, '-']] },
+    ]);
+
+    await page.evaluate(() => {
+      window.__capturedRaw = null;
+      window.__sendToPebbleCalled = false;
+      const origSendToPebble = window.sendToPebble;
+      window.sendToPebble = (...a) => { window.__sendToPebbleCalled = true; return origSendToPebble(...a); };
+      window.sendRawToPebble = (s) => { window.__capturedRaw = s; };
+    });
+
+    await page.click('.tab-btn[onclick*="tab-batch"]');
+    await page.waitForTimeout(200);
+    await page.fill('#routineTextArea', importData);
+    await page.click('button:has-text("Import")');
+
+    const raw = await page.evaluate(() => window.__capturedRaw);
+    const usedSendToPebble = await page.evaluate(() => window.__sendToPebbleCalled);
+
+    expect(usedSendToPebble).toBe(false);
+    expect(raw).toMatch(/^BATCH~/);
+    expect(raw).toContain('W1H');
+    expect(raw).toContain('W1L');
+    // Embedded weight progression (prog=0), not DOM default (-1)
+    expect(raw).toMatch(/^BATCH~W1H\|0\|2\|/);
+  });
+});

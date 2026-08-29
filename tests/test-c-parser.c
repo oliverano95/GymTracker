@@ -132,6 +132,65 @@ int main(void) {
     CHECK(n == 2, "batch with no trailing '~' returns 2");
   }
 
+  /* ---- Colon in routine name (real GymTracker data) ----
+     Routine names like "W1H1: Mell-Hát" contain a colon. The colon lives in
+     token[0] and MUST NOT be confused with the header-detection logic or
+     produce a phantom "2" routine. */
+
+  rp_clear(&r);
+  routine_parse_string("W1H1: Mell-Hát|0|2|Fekvenyomás|5|8|50|0|-|", &r);
+  CHECK(strcmp(r.routine_name, "W1H1: Mell-Hát") == 0,
+        "colon in name preserved (weight header)");
+  CHECK(r.total_exercises == 1 && strcmp(r.exercises[0].name, "Fekvenyomás") == 0,
+        "colon-name routine parses exercise correctly");
+
+  /* Legacy (no header) + colon name. */
+  rp_clear(&r);
+  routine_parse_string("W1H1: Mell-Hát|Fekvenyomás|5|8|50|0|-|", &r);
+  CHECK(strcmp(r.routine_name, "W1H1: Mell-Hát") == 0,
+        "colon in name preserved (legacy, no header)");
+  CHECK(r.total_exercises == 1 && strcmp(r.exercises[0].name, "Fekvenyomás") == 0,
+        "legacy colon-name routine parses exercise correctly");
+
+  /* ---- Real 6-routine batch (Hungarian names) must yield 6, never a "2" ---- */
+  {
+    char b2[512];
+    strcpy(b2,
+      "W1H1: Mell-Hát|0|2|Fekvenyomás|5|8|50|0|-|"
+      "~W1Sz: Láb-Has|0|2|Guggolás|5|8|20|0|-|"
+      "~W1P: Váll-Kar|0|2|Oldalemelés|5|8|10|0|-|"
+      "~W2H: Mell-Hát|0|2|Fekvenyomás|5|8|25|0|-|"
+      "~W2Sz: Láb-Has|0|2|Vádli|5|15|65|0|-|"
+      "~W2P: Váll-Kar|0|2|Oldalemelés csigán|5|8|15|0|-");
+    int n = routine_parse_batch_validate(b2);
+    CHECK(n == 6, "real 6-routine batch (colon names) returns 6");
+
+    /* Parse each segment (fresh copy — validate mutates the buffer) and
+       assert no routine is named "2". */
+    char b3[512];
+    strcpy(b3,
+      "W1H1: Mell-Hát|0|2|Fekvenyomás|5|8|50|0|-|"
+      "~W1Sz: Láb-Has|0|2|Guggolás|5|8|20|0|-|"
+      "~W1P: Váll-Kar|0|2|Oldalemelés|5|8|10|0|-|"
+      "~W2H: Mell-Hát|0|2|Fekvenyomás|5|8|25|0|-|"
+      "~W2Sz: Láb-Has|0|2|Vádli|5|15|65|0|-|"
+      "~W2P: Váll-Kar|0|2|Oldalemelés csigán|5|8|15|0|-");
+    char *seg = b3;
+    int cnt = 0;
+    while (*seg) {
+      char *end = strchr(seg, '~');
+      if (end) *end = '\0';
+      rp_clear(&r);
+      routine_parse_string(seg, &r);
+      CHECK(r.routine_name[0] != '\0' && strcmp(r.routine_name, "2") != 0,
+            "batch segment has a real (non-\"2\") name");
+      cnt++;
+      if (!end) break;
+      seg = end + 1;
+    }
+    CHECK(cnt == 6, "batch has exactly 6 named segments");
+  }
+
   printf("\n%s\n", g_fail ? "PARSER TESTS FAILED" : "PARSER TESTS PASSED");
   return g_fail;
 }
