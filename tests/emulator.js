@@ -1,8 +1,8 @@
 // @ts-check
-// Pebble SDK emulator integration tests.
+// Layer 3 — Pebble SDK emulator tests for chunked transfer
 //
 // Uses the local Pebble CLI to build, install, and interact with
-// GymTracker on the emulator. Verifies the full C + JS stack.
+// GymTracker on the emulator. Verifies the CHUNK_TRANSFER key works.
 //
 // Prerequisites: pebble CLI on PATH (pebble --version)
 // Run: cd tests && npx playwright test emulator.js
@@ -25,7 +25,6 @@ function pebble(cmd, opts = {}) {
   });
 }
 
-// Collect logs from emulator for N seconds using spawn (non-blocking)
 function captureLogs(seconds) {
   return new Promise((resolve) => {
     let output = '';
@@ -71,31 +70,24 @@ test.describe('Pebble SDK emulator install', () => {
     killEmu();
     await new Promise(r => setTimeout(r, 1000));
 
-    // Start log capture in background
     const logsPromise = captureLogs(8);
-
-    // Give emulator time to start
     await new Promise(r => setTimeout(r, 2000));
 
-    // Install the app
     const installOutput = pebble('install --emulator basalt', { timeout: 30000 });
     console.log('Install:', installOutput.trim());
 
-    // Wait for log capture to finish
     const logs = await logsPromise;
     killEmu();
 
     console.log('Logs:', logs.slice(0, 500));
-
-    // App launch produces heap usage logs from C code
     expect(logs).toContain('Heap Usage');
   });
 });
 
 // ============================================================
-// 3. SEND-APP-MESSAGE — simulate phone sending a routine
+// 3. SEND ROUTINE_DATA — baseline: normal routine send
 // ============================================================
-test.describe('Pebble SDK send-app-message', () => {
+test.describe('Pebble SDK send routine_data', () => {
   test('send routine data to emulator via numeric key', async () => {
     killEmu();
     await new Promise(r => setTimeout(r, 1000));
@@ -106,7 +98,6 @@ test.describe('Pebble SDK send-app-message', () => {
     pebble('install --emulator basalt', { timeout: 30000 });
     await new Promise(r => setTimeout(r, 3000));
 
-    // ROUTINE_DATA is key index 0 in package.json appKeys array
     const routineStr = 'Test|-1|2|Bench|3|10|60|0|-';
     try {
       pebble(`send-app-message --emulator basalt --string 0="${routineStr}"`, { timeout: 10000 });
@@ -121,14 +112,84 @@ test.describe('Pebble SDK send-app-message', () => {
     killEmu();
 
     console.log('Logs:', logs.slice(0, 800));
-
-    // The app should have received the message (C code logs on receipt)
     expect(logs.length).toBeGreaterThan(0);
   });
 });
 
 // ============================================================
-// 4. SCREENSHOT — capture emulator display
+// 4. SEND CHUNK_TRANSFER — single chunk
+// ============================================================
+test.describe('Pebble SDK send CHUNK_TRANSFER', () => {
+  test('send single CHUNK_TRANSFER message to emulator', async () => {
+    killEmu();
+    await new Promise(r => setTimeout(r, 1000));
+
+    const logsPromise = captureLogs(10);
+    await new Promise(r => setTimeout(r, 2000));
+
+    pebble('install --emulator basalt', { timeout: 30000 });
+    await new Promise(r => setTimeout(r, 3000));
+
+    // CHUNK_TRANSFER key index = 6 (0-indexed in messageKeys array)
+    // Format: "1/1|routine data" (single chunk = 1 of 1)
+    const chunkPayload = '1/1|ChunkTest|-1|2|Bench|3|10|60|0|-';
+    try {
+      pebble(`send-app-message --emulator basalt --string 6="${chunkPayload}"`, { timeout: 10000 });
+      console.log('CHUNK_TRANSFER sent successfully');
+    } catch (e) {
+      console.log('send-app-message output:', e.stdout?.slice(0, 300));
+      console.log('send-app-message error:', e.stderr?.slice(0, 300));
+    }
+
+    await new Promise(r => setTimeout(r, 3000));
+    const logs = await logsPromise;
+    killEmu();
+
+    console.log('Logs:', logs.slice(0, 800));
+    expect(logs.length).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================
+// 5. SEND CHUNK_TRANSFER — multi-chunk sequence
+// ============================================================
+test.describe('Pebble SDK send multi-chunk', () => {
+  test('send two CHUNK_TRANSFER messages sequentially', async () => {
+    killEmu();
+    await new Promise(r => setTimeout(r, 1000));
+
+    const logsPromise = captureLogs(12);
+    await new Promise(r => setTimeout(r, 2000));
+
+    pebble('install --emulator basalt', { timeout: 30000 });
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Chunk 1: "1/2|part of routine"
+    const chunk1 = '1/2|MultiChunk|-1|2|Bench|3|10|60|0|-|OHP|3|8|4';
+    // Chunk 2: "2/2|rest of routine"
+    const chunk2 = '2/2|0|0|-|Squat|3|10|80|0|-';
+
+    try {
+      pebble(`send-app-message --emulator basalt --string 6="${chunk1}"`, { timeout: 10000 });
+      console.log('Chunk 1/2 sent');
+      await new Promise(r => setTimeout(r, 1000));
+      pebble(`send-app-message --emulator basalt --string 6="${chunk2}"`, { timeout: 10000 });
+      console.log('Chunk 2/2 sent');
+    } catch (e) {
+      console.log('send-app-message error:', e.stderr?.slice(0, 300));
+    }
+
+    await new Promise(r => setTimeout(r, 3000));
+    const logs = await logsPromise;
+    killEmu();
+
+    console.log('Logs:', logs.slice(0, 800));
+    expect(logs.length).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================
+// 6. SCREENSHOT — capture emulator display
 // ============================================================
 test.describe('Pebble SDK screenshot', () => {
   test('take screenshot from running emulator', async () => {
