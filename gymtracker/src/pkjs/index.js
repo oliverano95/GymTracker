@@ -5,8 +5,8 @@
 // ============================================================
 var CONFIG = {
   isDevMode: true,
-  configUrlDev: 'http://192.168.1.111:8080/index_dev.html',
-  configUrlProd: 'http://192.168.1.111:8080/index.html',
+  configUrlDev: 'http://192.168.1.111:8081/index_dev.html',
+  configUrlProd: 'http://192.168.1.111:8081/index.html',
   maxHistory: 15
 };
 
@@ -227,7 +227,7 @@ Pebble.addEventListener('webviewclosed', function(e) {
 
   if (decoded.charAt(0) !== '{') {
     // Raw sync string — not JSON
-    console.log('webviewclosed: raw sync string detected (' + decoded.length + ' chars)');
+    console.log('webviewclosed: raw sync string detected (' + decoded.length + ' chars): ' + decoded.substring(0, 100));
     handleRawSyncString(decoded);
     return;
   }

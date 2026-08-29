@@ -1,10 +1,10 @@
 // @ts-check
 const { defineConfig } = require('@playwright/test');
-const path = require('path');
-
-module.exports = defineConfig({
   testDir: '.',
+  testMatch: ['test-config-page.js', 'emulator.js', 'test-chunked-transfer.js', 'test-pkjs-chunking.js', 'test-beta-bugfix.js', 'test-c-parser.js'],
   testMatch: ['test-config-page.js', 'emulator.js'],
+  testDir: '.',
+  testMatch: ['test-chunked-transfer.js', 'test-pkjs-chunking.js', 'emulator.js', 'test-beta-bugfix.js', 'test-c-parser.js'],
   timeout: 60_000,
   expect: { timeout: 5_000 },
   fullyParallel: false,
@@ -12,14 +12,3 @@ module.exports = defineConfig({
   reporter: 'list',
   use: {
     headless: true,
-    viewport: { width: 400, height: 800 },
-    actionTimeout: 5_000,
-    ignoreHTTPSErrors: true,
-  },
-  projects: [
-    {
-      name: 'chromium',
-      use: { browserName: 'chromium' },
-    },
-  ],
-});

@@ -315,6 +315,7 @@
     <button id="btn-add-batch"    class="batch-btn" onclick="addToBatch()">📦 + Add Current Routine to Batch</button>
     <button id="btn-send-single"  style="padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2);" onclick="saveAndSendSingle()">Save &amp; Send Single Routine to Watch</button>
     <button id="btn-send-google"  style="display:none; padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2); background:var(--green);" onclick="saveAndSendSingle()">☁️ Save Google Settings to Watch</button>
+    <p style="font-size:12px; color:gray; margin:8px 0 0;">Sending transfers data to the watch, so this page will close automatically — that's expected. Reopen it to edit more.</p>
 </div>
 
 <script>
@@ -1053,6 +1054,7 @@ function buildConfigPayload(routineData) {
 function sendToPebble(configData) {
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
     const encoded  = encodeURIComponent(JSON.stringify(configData));
+    console.log('sendToPebble: encoded.length=' + encoded.length);
     if (encoded.length > MAX_CONFIG_RESPONSE) {
         alert(`⚠️ Settings payload is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer (longer responses are silently dropped and never reach the watch). Please shorten exercise names/comments or split the routine.`);
         return;
@@ -1063,8 +1065,9 @@ function sendToPebble(configData) {
 function sendRawToPebble(syncString) {
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
     const encoded  = encodeURIComponent(syncString);
+    console.log('sendRawToPebble: encoded.length=' + encoded.length + ' (routines are split into chunks by pkjs when needed)');
     if (encoded.length > MAX_CONFIG_RESPONSE) {
-        alert(`⚠️ Routine is ${encoded.length} encoded chars — over the ${MAX_CONFIG_RESPONSE}-char limit. The watch will receive it in chunks automatically. Continuing...`);
+        console.log(`Routine is ${encoded.length} encoded chars — pkjs will chunk it automatically.`);
     }
     window.location.href = returnTo + encoded;
 }
@@ -1165,8 +1168,18 @@ function saveAndSendSingle() {
     if (shouldClearHistory)  payload.clearHistory = true;
     if (shouldClearGoogle)   payload.clearGoogle  = true;
 
-    const hasOnlyRoutine = Object.keys(payload).length === 1 && payload.routineData;
-    if (hasOnlyRoutine) {
+    // CRITICAL: set window.location EXACTLY ONCE per save.
+    // The pebblejs://close# navigation fires webviewclosed in pkjs; a SECOND
+    // navigation overrides the first, so the LAST response wins and the
+    // routine is silently lost ("nothing arrives on the watch" bug).
+    //
+    // If there is a routine to transmit, send it as a raw sync string (single
+    // navigation). pkjs then chunks it into CHUNK_TRANSFER app messages.
+    // Google url/password are already persisted in pkjs localStorage from the
+    // previous config session, so they are NOT re-sent here (avoids the
+    // double-navigation). clear flags are rare, deliberate actions handled
+    // by their own buttons; if a routine is also pending, the routine wins.
+    if (routineStr) {
         sendRawToPebble(routineStr);
     } else if (Object.keys(payload).length > 0) {
         sendToPebble(payload);
@@ -1228,6 +1241,11 @@ function sendBatchToPebble() {
     if (batchRoutines.length === 0) {
         alert('Your batch is empty! Add routines from the Builder first.'); return;
     }
+    const confirmMsg =
+        `Send ${batchRoutines.length} routine(s) to the watch?\n\n` +
+        `Warning: this REPLACES your entire routine library on the watch. ` +
+        `Any routines already on the watch that are not in this batch will be removed.`;
+    if (!window.confirm(confirmMsg)) return;
     const finalStr = 'BATCH~' + batchRoutines.map(r => r.dataStr).join('~');
     sendRawToPebble(finalStr);
 }

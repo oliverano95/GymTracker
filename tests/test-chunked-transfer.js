@@ -114,7 +114,7 @@ test.describe('Layer 1 — Raw sync string format', () => {
     expect(result).toContain('%7C');      // URL-encoded pipes
   });
 
-  test('T3: sendRawToPebble warns but still sends oversized payload', async ({ page }) => {
+  test('T3: sendRawToPebble sends oversized payload with no blocking alert', async ({ page }) => {
     await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
 
     let alertFired = false;
@@ -130,8 +130,9 @@ test.describe('Layer 1 — Raw sync string format', () => {
         const returnTo = 'pebblejs://close#';
         const encoded = encodeURIComponent(syncString);
         if (encoded.length > 450) {
-          // Alert is fired by the real function
-          window.alert(`Routine is ${encoded.length} encoded chars — over the 450-char limit.`);
+          // Real behaviour: chunking handles it phone-side, so only a
+          // console log is emitted — no blocking alert.
+          console.log(`Routine is ${encoded.length} encoded chars — pkjs will chunk it automatically.`);
         }
         nav = true; // Always navigates
       };
@@ -139,7 +140,7 @@ test.describe('Layer 1 — Raw sync string format', () => {
       return nav;
     });
 
-    expect(alertFired).toBe(true);
+    expect(alertFired).toBe(false);
     expect(navigated).toBe(true);
   });
 
@@ -197,7 +198,7 @@ test.describe('Layer 1 — Raw sync string format', () => {
     expect(result).toBe('A|1|2');
   });
 
-  test('T6: saveAndSendSingle uses JSON when google creds present', async ({ page }) => {
+  test('T6: routine + google creds sends raw routine (no JSON, single nav)', async ({ page }) => {
     await autoConfirm(page);
     await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
 
@@ -213,24 +214,19 @@ test.describe('Layer 1 — Raw sync string format', () => {
       document.getElementById('googlePwdInput').value = 'test-token';
     });
 
-    // Verify payload structure (hasOnlyRoutine should be false)
-    const result = await page.evaluate(() => {
-      const name = document.getElementById('routineName').value || 'My Routine';
-      const routineStr = serialiseRoutine(name, myRoutine);
-      const payload = {};
-      const googleUrl = document.getElementById('googleUrlInput').value;
-      const googlePwd = document.getElementById('googlePwdInput').value;
-      if (routineStr)          payload.routineData = routineStr;
-      if (googleUrl)           payload.googleUrl  = googleUrl;
-      if (googlePwd)           payload.googlePwd  = googlePwd;
-
-      const hasOnlyRoutine = Object.keys(payload).length === 1 && payload.routineData;
-      return { hasOnlyRoutine, keys: Object.keys(payload) };
+    // Capture actual navigation calls
+    const calls = await page.evaluate(() => {
+      const navs = [];
+      window.sendRawToPebble = function(s) { navs.push('RAW:' + s); };
+      window.sendToPebble = function(c) { navs.push('JSON:' + JSON.stringify(c)); };
+      saveAndSendSingle();
+      return navs;
     });
 
-    expect(result.hasOnlyRoutine).toBe(false);
-    expect(result.keys).toContain('googleUrl');
-    expect(result.keys).toContain('routineData');
+    // Exactly one navigation; carries the raw routine (not JSON)
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatch(/^RAW:/);
+    expect(calls[0]).not.toContain('googleUrl');
   });
 
   test('T7: sendBatchToPebble sends raw BATCH~ format', async ({ page }) => {
@@ -268,6 +264,48 @@ test.describe('Layer 1 — Raw sync string format', () => {
     expect(result.startsWithBatch).toBe(true);
     expect(result.batchStr).toContain('Routine 1');
     expect(result.batchStr).toContain('Routine 2');
+  });
+
+  test('T7b: sendBatchToPebble warns that it replaces the library', async ({ page }) => {
+    await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
+
+    // Add one routine to the batch. addToBatch fires a trailing alert() that
+    // we accept, and it clears the editor — that's fine for this test.
+    await page.fill('#routineName', 'Routine 1');
+    await page.fill('#targetSets', '3');
+    await page.fill('#targetReps', '10');
+    await page.fill('#targetWeight', '60');
+    await page.click('#addUpdateBtn');
+
+    // Accept the "added to batch" alert.
+    page.once('dialog', (d) => d.accept());
+    await page.click('#btn-add-batch');
+    await page.waitForTimeout(100);
+
+    // (1) Cancel the confirm: must NOT send.
+    let dialogMsg = '';
+    page.once('dialog', async (d) => { dialogMsg = d.message(); await d.dismiss(); });
+    const sent1 = await page.evaluate(() => {
+      let nav = false;
+      window.sendRawToPebble = function(s) { nav = true; };
+      sendBatchToPebble();
+      return nav;
+    });
+    expect(dialogMsg).toContain('REPLACES');
+    expect(dialogMsg).toContain('removed');
+    expect(sent1).toBe(false);
+
+    // (2) Accept the confirm: batch is sent.
+    dialogMsg = '';
+    page.once('dialog', async (d) => { dialogMsg = d.message(); await d.accept(); });
+    const sent2 = await page.evaluate(() => {
+      let nav = false;
+      window.sendRawToPebble = function(s) { nav = true; };
+      sendBatchToPebble();
+      return nav;
+    });
+    expect(dialogMsg).toContain('REPLACES');
+    expect(sent2).toBe(true);
   });
 
   test('T8: sendRawToPebble encoded length is reasonable', async ({ page }) => {

@@ -1,4 +1,5 @@
 #include <pebble.h>
+#include "routine_parse.h"
 
 // ========================================================================= //
 //                            1. MACROS & DEFINES                            //
@@ -450,63 +451,54 @@ static void save_setting(SettingsKey key, int value) {
   persist_write_int(SETTINGS_KEY_BASE + (int)key, value);
 }
 
+// Parse a routine sync string into s_app.state. The tokenising/header
+// detection lives in routine_parse.c (shared with host-side unit tests) to
+// keep the exact parsing logic testable without a Pebble toolchain.
 static void parse_routine_string(const char *data) {
   s_app.state.total_exercises = 0;
   memset(&s_app.state.exercises, 0, sizeof(s_app.state.exercises));
-  if (!data) return;
 
-  int i = 0, token_count = 0, t_idx = 0;
-  char temp[32];
+  RpResult rp;
+  routine_parse_string(data, &rp);
 
-  while (true) {
-    if (data[i] == '|' || data[i] == '\0') {
-      temp[t_idx] = '\0';
-      if (token_count == 0) {
-        snprintf(s_app.state.routine_name, sizeof(s_app.state.routine_name), "%s", temp);
-      } else {
-        int ex_idx = (token_count - 1) / 6;
-        int field  = (token_count - 1) % 6;
+  snprintf(s_app.state.routine_name, sizeof(s_app.state.routine_name),
+           "%s", rp.routine_name);
 
-        if (ex_idx < MAX_EXERCISES) {
-          Exercise *ex = &s_app.state.exercises[ex_idx];
-          if      (field == 0) snprintf(ex->name,    sizeof(ex->name),    "%s", temp);
-          else if (field == 1) ex->target_sets   = atoi(temp);
-          else if (field == 2) ex->target_reps   = atoi(temp);
-          else if (field == 3) ex->target_weight = atoi(temp);
-          else if (field == 4) {
-            ex->modifier = atoi(temp);
-            if (ex->modifier == 4) { ex->modifier = 0; ex->target_weight = 0; }
-            if (ex->modifier == 6) { ex->target_weight = 0; }
-            if (ex->modifier == 1) {
-              ex->target_sets *= 2;
-            }
-            // actual_reps/actual_weight hold at most 10 sets — clamp every
-            // modifier, not just drop sets, or set 11+ corrupts memory.
-            if (ex->target_sets > 10) ex->target_sets = 10;
-            if (ex->target_sets < 1)  ex->target_sets = 1;
-            ex->current_set = 1;
-          } else if (field == 5) {
-            if (strcmp(temp, "-") == 0) {
-              ex->comment[0] = '\0';
-            } else {
-              snprintf(ex->comment, sizeof(ex->comment), "%s", temp);
-            }
-            s_app.state.total_exercises = ex_idx + 1;
-          }
-        }
-      }
-      token_count++;
-      t_idx = 0;
-      if (data[i] == '\0') break;
-    } else {
-      if (t_idx < 31) temp[t_idx++] = data[i];
+  int n = rp.total_exercises;
+  if (n > MAX_EXERCISES) n = MAX_EXERCISES;
+  for (int i = 0; i < n; i++) {
+    snprintf(s_app.state.exercises[i].name, sizeof(s_app.state.exercises[i].name),
+             "%s", rp.exercises[i].name);
+    snprintf(s_app.state.exercises[i].comment, sizeof(s_app.state.exercises[i].comment),
+             "%s", rp.exercises[i].comment);
+    s_app.state.exercises[i].target_sets   = rp.exercises[i].target_sets;
+    s_app.state.exercises[i].target_reps   = rp.exercises[i].target_reps;
+    s_app.state.exercises[i].target_weight = rp.exercises[i].target_weight;
+    s_app.state.exercises[i].modifier      = rp.exercises[i].modifier;
+    s_app.state.exercises[i].current_set   = rp.exercises[i].current_set;
+    if (rp.exercises[i].modifier == 1) {
+      // Drop sets double the set count on the watch
+      s_app.state.exercises[i].target_sets *= 2;
+      if (s_app.state.exercises[i].target_sets > 10) s_app.state.exercises[i].target_sets = 10;
     }
-    i++;
   }
-
+  s_app.state.total_exercises = n;
   s_app.state.total_workout_sets = 0;
   for (int k = 0; k < s_app.state.total_exercises; k++)
     s_app.state.total_workout_sets += s_app.state.exercises[k].target_sets;
+
+  // INFO level so it survives release builds and is visible via
+  // `pebble logs` on the emulator / phone — this lets automated tests assert
+  // on the parsed result (see tests/emulator.js).
+  APP_LOG(APP_LOG_LEVEL_INFO, "parse_routine: name=%s exercises=%d",
+          s_app.state.routine_name, s_app.state.total_exercises);
+  for (int k = 0; k < s_app.state.total_exercises; k++)
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "  ex[%d]=%s sets=%d reps=%d wt=%d mod=%d",
+            k, s_app.state.exercises[k].name,
+            s_app.state.exercises[k].target_sets,
+            s_app.state.exercises[k].target_reps,
+            s_app.state.exercises[k].target_weight,
+            s_app.state.exercises[k].modifier);
 }
 
 static void format_relative_time(char *buf, size_t size, int timestamp) {
@@ -3768,6 +3760,45 @@ static void push_timer_edit_window(void) {
 // ========================================================================= //
 //                        10. APP MESSAGE (INBOX)                            //
 // ========================================================================= //
+
+// Parse + commit a "BATCH~r1~r2~..." payload. The payload buffer is MUTATED:
+// each '~' separator becomes '\0' so every routine string can be tokenised in
+// place. Safe by design:
+//   1. The whole batch is VALIDATED first by routine_parse_batch_validate
+//      (every segment must parse to a routine with a name and one exercise).
+//   2. Only after validation succeeds are existing slots wiped and rewritten.
+//   3. If any segment is malformed/truncated, the library is left untouched
+//      (a bad batch must never destroy previously synced routines).
+// Returns true if the batch was committed.
+static bool process_batch_payload(char *payload) {
+  if (strncmp(payload, "BATCH~", 6) != 0) return false;
+
+  int count = routine_parse_batch_validate(payload + 6);
+  if (count <= 0 || count > MAX_SLOTS) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "batch invalid (%d routines), library untouched", count);
+    return false;
+  }
+
+  // Valid batch — wipe slots, then rewrite in place.
+  for (int i = 0; i < MAX_SLOTS; i++) {
+    persist_delete(STORAGE_KEY_BASE + i);
+    for (int j = 0; j < MAX_EXERCISES; j++)
+      persist_delete(ROUTINE_EX_BASE + (i * MAX_EXERCISES) + j);
+    persist_delete(LAST_COMPLETED_KEY_BASE + i);
+  }
+  s_app.storage.active_slots = 0;
+
+  char *seg = payload + 6;
+  int slot_idx = 0;
+  while (slot_idx < MAX_SLOTS && *seg) {
+    parse_routine_string(seg);
+    save_routine_to_slot(slot_idx++);
+    seg += strlen(seg) + 1;          // next routine (separators are '\0' now)
+  }
+  APP_LOG(APP_LOG_LEVEL_INFO, "batch committed: %d routine(s)", slot_idx);
+  return true;
+}
+
 static void inbox_received_callback(DictionaryIterator *iterator, void *context) {
 
   // ----------- Handle full routines sent from phone -----------
@@ -3778,32 +3809,7 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     inbox_copy[sizeof(inbox_copy) - 1] = '\0';
 
     if (strncmp(inbox_copy, "BATCH~", 6) == 0) {
-      for (int i = 0; i < MAX_SLOTS; i++) {
-        persist_delete(STORAGE_KEY_BASE + i);
-        for (int j = 0; j < MAX_EXERCISES; j++)
-          persist_delete(ROUTINE_EX_BASE + (i * MAX_EXERCISES) + j);
-        persist_delete(LAST_COMPLETED_KEY_BASE + i);
-      }
-      s_app.storage.active_slots = 0;
-
-      char *start   = inbox_copy + 6;
-      char *end     = start;
-      int slot_idx  = 0;
-
-      while (*end != '\0' && slot_idx < MAX_SLOTS) {
-        if (*end == '~') {
-          *end = '\0';                // safe: modifying our own local copy
-          parse_routine_string(start);
-          save_routine_to_slot(slot_idx++);
-          start = end + 1;
-        }
-        end++;
-      }
-      if (*start != '\0' && slot_idx < MAX_SLOTS) {
-        parse_routine_string(start);
-        save_routine_to_slot(slot_idx);
-      }
-      vibes_double_pulse();
+      if (process_batch_payload(inbox_copy)) vibes_double_pulse();
 
     } else {
       parse_routine_string(inbox_copy);
@@ -3917,10 +3923,18 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
           chunk_buf[0] = '\0';
         }
 
-        // All chunks received — process the complete routine
+        // All chunks received — process the complete payload
         if (chunk_in_progress && chunk_received_count == chunk_expected_total) {
           chunk_in_progress = false;
 
+          // A chunked BATCH ("BATCH~r1~r2~...") must go through the same
+          // validate-then-wipe batch path as a direct send. Without this, the
+          // whole batch would be parsed as ONE routine named "BATCH~...".
+          if (strncmp(chunk_buf, "BATCH~", 6) == 0) {
+            if (process_batch_payload(chunk_buf)) vibes_double_pulse();
+            refresh_directory();
+            menu_layer_reload_data(s_app.ui.menu_layer);
+          } else {
           // Process as if it were a normal ROUTINE_DATA message
           parse_routine_string(chunk_buf);
 
@@ -3957,6 +3971,7 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
           refresh_directory();
           menu_layer_reload_data(s_app.ui.menu_layer);
           vibes_double_pulse();
+          }
         }
       }
     }
