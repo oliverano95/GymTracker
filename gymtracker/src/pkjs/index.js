@@ -153,6 +153,31 @@ function autoSyncRoutine(syncString, routineName, parsedRoutine) {
 // PEBBLE EVENT LISTENERS
 // ============================================================
 
+// Helper: get persistent watch-side tombstone list (survives webview clears).
+// This is the authoritative "deleted routines" list on the watch side,
+// separate from the config-page webview's deletedSyncKeys (which may be lost
+// on a cleared webview).
+function getDeletedRoutines() {
+  return Storage.getJSON('deleted_routines', []);
+}
+
+function addDeletedRoutine(name) {
+  var deleted = getDeletedRoutines();
+  if (deleted.indexOf(name) === -1) {
+    deleted.push(name);
+    Storage.setJSON('deleted_routines', deleted);
+  }
+}
+
+function removeDeletedRoutine(name) {
+  var deleted = getDeletedRoutines();
+  var idx = deleted.indexOf(name);
+  if (idx !== -1) {
+    deleted.splice(idx, 1);
+    Storage.setJSON('deleted_routines', deleted);
+  }
+}
+
 // 1. JS environment ready
 Pebble.addEventListener('ready', function() {
   console.log('PebbleKit JS ready.');
@@ -166,6 +191,29 @@ Pebble.addEventListener('showConfiguration', function() {
   var googlePwd      = Storage.get('googlePwd', '');
   var syncedRoutines = Storage.get('synced_routines', '{}');
   var historyArr     = Storage.getJSON('workoutHistory', []);
+  var deletedRoutines = getDeletedRoutines(); // watch-side persistent tombstone
+
+  // Filter out tombstoned names from synced_routines before passing to config page.
+  // This prevents the config page from re-seeding deleted routines when the
+  // webview has been cleared (deletedSyncKeys lost) while the watch still has
+  // them in synced_routines. The config page's ephemeral deletedSyncKeys and
+  // this persistent watch-side tombstone work together: whichever survives a
+  // webview clear determines the outcome.
+  if (deletedRoutines.length > 0) {
+    try {
+      var syncedObj = JSON.parse(syncedRoutines);
+      var filtered = {};
+      var keys = Object.keys(syncedObj);
+      for (var i = 0; i < keys.length; i++) {
+        if (deletedRoutines.indexOf(keys[i]) === -1) {
+          filtered[keys[i]] = syncedObj[keys[i]];
+        }
+      }
+      syncedRoutines = JSON.stringify(filtered);
+    } catch (e) {
+      console.log('Warning: failed to parse synced_routines for tombstone exclusion: ' + e);
+    }
+  }
 
   var SAFE_URL_LIMIT = 7000; // GitHub Pages rejects URLs over ~8KB
 
@@ -250,10 +298,12 @@ Pebble.addEventListener('webviewclosed', function(e) {
   // --- Two-Way Sync routines ---
   var synced = Storage.getJSON('synced_routines', {});
 
-  // 1. Purge deleted keys
+  // 1. Purge deleted keys from synced_routines AND add to persistent tombstone
+  //    so they survive a webview clear and aren't re-seeded on next config open.
   if (Array.isArray(configData.deletedKeys)) {
     configData.deletedKeys.forEach(function(key) {
       delete synced[key];
+      addDeletedRoutine(key); // watch-side persistent tombstone
     });
   }
 
@@ -261,6 +311,7 @@ Pebble.addEventListener('webviewclosed', function(e) {
   if (configData.updatedSync) {
     Object.keys(configData.updatedSync).forEach(function(key) {
       synced[key] = configData.updatedSync[key];
+      removeDeletedRoutine(key); // re-creating clears tombstone
     });
   }
 

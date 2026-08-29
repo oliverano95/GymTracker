@@ -1118,6 +1118,7 @@ function sendToPebble(configData) {
         alert(`⚠️ Settings payload is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer (longer responses are silently dropped and never reach the watch). Please shorten exercise names/comments or split the routine.`);
         return;
     }
+    _hasNavigated = true;
     window.location.href = returnTo + encoded;
 }
 
@@ -1514,6 +1515,9 @@ function flagClearGoogle() {
 // ============================================================
 // INITIALISATION
 // ============================================================
+// Flag to prevent double-navigation if user already clicked "Save & Send"
+let _hasNavigated = false;
+
 window.addEventListener('load', () => {
     renderExerciseDropdown();
     updateModifierDesc();
@@ -1649,6 +1653,23 @@ window.addEventListener('load', () => {
             );
         }
     } catch {}
+});
+
+// Send deletions to pkjs on every close (even without explicit Save & Send).
+// This ensures deletedKeys reach the watch-side persistent tombstone, so
+// routines deleted in the config page don't resurrect when the webview is
+// cleared and pkjs re-seeds synced_routines on next config open.
+window.addEventListener('beforeunload', () => {
+    if (_hasNavigated) return; // already sent via Save & Send
+    if (deletedKeys.length === 0 && Object.keys(modifiedRoutines).length === 0) return;
+
+    const payload = {};
+    if (deletedKeys.length > 0) payload.deletedKeys = deletedKeys;
+    if (Object.keys(modifiedRoutines).length > 0) payload.updatedSync = modifiedRoutines;
+
+    const returnTo = getQueryParam('return_to', 'pebblejs://close#');
+    const encoded  = encodeURIComponent(JSON.stringify(payload));
+    window.location.replace(returnTo + encoded);
 });
 </script>
 </body>
