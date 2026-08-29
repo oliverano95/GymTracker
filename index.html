@@ -1137,8 +1137,16 @@ function getAllRoutineDefinitions() {
 }
 
 function exportRoutinesToCSV() {
-    const googleUrl = document.getElementById('googleUrlInput').value;
-    const googlePwd = document.getElementById('googlePwdInput').value;
+    // Reuse the already-configured Google endpoint: typed value → URL query
+    // param (pkjs injects googleUrl/googlePwd on every config-page open) →
+    // localStorage. Matches the workout-export fallback so users aren't asked
+    // to re-enter an endpoint they've already configured.
+    const googleUrl = document.getElementById('googleUrlInput').value.trim()
+                   || getQueryParam('googleUrl', '').trim()
+                   || Storage.get('googleUrl', '');
+    const googlePwd = document.getElementById('googlePwdInput').value.trim()
+                   || getQueryParam('googlePwd', '').trim()
+                   || Storage.get('googlePwd', '');
 
     if (!googleUrl || !googleUrl.trim()) {
         alert('Please enter a Google Script URL first.');
