@@ -32,6 +32,31 @@ test.describe('C routine parser (routine_parse.c)', () => {
     expect(run).not.toContain('FAIL:');
   });
 
+  test('C7: memory-safety stress under ASan+UBSan+leak-detection', () => {
+    fs.mkdirSync('/tmp', { recursive: true });
+
+    const cc = process.env.CC || 'cc';
+    const memExe = path.join('/tmp', `c_parser_mem_${process.pid}`);
+
+    // Compile the parser with the SAME source the watch uses, but with
+    // AddressSanitizer + UndefinedBehaviorSanitizer + leak detection.
+    execSync(
+      `${cc} -fsanitize=address,undefined -g -I ${SRC} ${path.join(ROOT, 'tests', 'test-c-parser-mem.c')} ${path.join(SRC, 'routine_parse.c')} -o ${memExe}`,
+      { encoding: 'utf8' }
+    );
+
+    const run = execSync(memExe, {
+      encoding: 'utf8',
+      env: { ...process.env, ASAN_OPTIONS: 'detect_leaks=1:halt_on_error=1' },
+    });
+    console.log(run);
+    expect(run).toContain('MEM STRESS');
+    expect(run).toContain('PASSED');
+    expect(run).not.toMatch(/ERROR: AddressSanitizer|runtime error:/);
+
+    try { fs.unlinkSync(memExe); } catch {}
+  });
+
   test.afterAll(() => {
     try { fs.unlinkSync(BIN); } catch {}
     try { fs.unlinkSync(EXE); } catch {}
