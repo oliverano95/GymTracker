@@ -6,7 +6,7 @@
 // ========================================================================= //
 #define MAX_EXERCISES 15
 #define MAX_SLOTS 7
-#define EXPORT_BUF_SIZE 1024
+#define EXPORT_BUF_SIZE 2048
 #define CHUNK_BUF_SIZE 2048
 
 #define STORAGE_KEY_BASE   100
