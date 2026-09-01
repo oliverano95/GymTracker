@@ -1146,6 +1146,12 @@ function saveAndSendSingle() {
         return;
     }
 
+    // Snapshot synced state BEFORE saveRoutineToStorage — on some branches
+    // (issue #46 fix) saveRoutineToStorage overwrites syncedRoutinesDict[name],
+    // which would make routineMatchesSyncedCopy always return true and strip
+    // exercises from the payload.
+    const syncedSnapshot = { ...syncedRoutinesDict };
+
     saveRoutineToStorage(name, myRoutine,
         document.getElementById('progressionMode').value,
         document.getElementById('weightIncrement').value);
@@ -1153,7 +1159,7 @@ function saveAndSendSingle() {
 
     let routineStr = '';
     if (myRoutine.length > 0) {
-        if (routineMatchesSyncedCopy(name)) {
+        if (syncedSnapshot[name] && routineMatchesSyncedCopy(name)) {
             const progMode = document.getElementById('progressionMode').value;
             const weightInc = document.getElementById('weightIncrement').value;
             routineStr = `${name}|${progMode}|${weightInc}`;

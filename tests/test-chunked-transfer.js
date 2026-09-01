@@ -198,6 +198,74 @@ test.describe('Layer 1 — Raw sync string format', () => {
     expect(result).toBe('A|1|2');
   });
 
+  test('T5b: saveAndSendSingle includes exercises for new routine (not in syncedDict)', async ({ page }) => {
+    await autoConfirm(page);
+    await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
+
+    // Add 1 exercise (default dropdown = Bench Press)
+    await page.fill('#routineName', 'Leg Day');
+    await page.fill('#targetSets', '3');
+    await page.fill('#targetReps', '10');
+    await page.fill('#targetWeight', '80');
+    await page.click('#addUpdateBtn');
+
+    const myRoutineLen = await page.evaluate(() => myRoutine.length);
+    expect(myRoutineLen).toBe(1);
+
+    // Capture what saveAndSendSingle actually sends
+    const captured = await page.evaluate(() => {
+      window.__capturedRaw = null;
+      window.sendRawToPebble = (s) => { window.__capturedRaw = s; };
+      window.sendToPebble = () => {};
+      saveAndSendSingle();
+      return window.__capturedRaw;
+    });
+
+    expect(captured).not.toBeNull();
+    expect(captured).toContain('Leg Day');
+    expect(captured).toContain('Bench Press');
+    // Must contain exercise data, not just header (name|prog|inc)
+    expect(captured.split('|').length).toBeGreaterThan(4);
+  });
+
+  test('T5c: saveAndSendSingle includes exercises even when saveRoutineToStorage overwrites syncedDict', async ({ page }) => {
+    await autoConfirm(page);
+    await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
+
+    // Add 1 exercise
+    await page.fill('#routineName', 'Push Day');
+    await page.fill('#targetSets', '3');
+    await page.fill('#targetReps', '10');
+    await page.fill('#targetWeight', '60');
+    await page.click('#addUpdateBtn');
+
+    // Capture what saveAndSendSingle sends when saveRoutineToStorage overwrites syncedDict
+    const captured = await page.evaluate(() => {
+      window.__capturedRaw = null;
+      window.sendRawToPebble = (s) => { window.__capturedRaw = s; };
+      window.sendToPebble = () => {};
+
+      // Monkey-patch saveRoutineToStorage to also overwrite syncedRoutinesDict
+      // (this is what the main-branch issue #46 fix does)
+      const origSave = saveRoutineToStorage;
+      window.saveRoutineToStorage = function(name, exercises, progMode, weightInc) {
+        origSave(name, exercises, progMode, weightInc);
+        const syncStr = serialiseRoutine(name, exercises);
+        syncedRoutinesDict[name] = syncStr;
+      };
+
+      saveAndSendSingle();
+      return window.__capturedRaw;
+    });
+
+    expect(captured).not.toBeNull();
+    // Even when saveRoutineToStorage overwrites syncedRoutinesDict,
+    // full routine must be sent because snapshot is taken before the overwrite.
+    expect(captured).toContain('Push Day');
+    expect(captured).toContain('Bench Press');
+    expect(captured.split('|').length).toBeGreaterThan(4);
+  });
+
   test('T6: routine + google creds sends raw routine (no JSON, single nav)', async ({ page }) => {
     await autoConfirm(page);
     await openWithSeed(page, { syncDict: {}, savedRoutines: [] });
