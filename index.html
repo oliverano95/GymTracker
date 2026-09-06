@@ -313,10 +313,8 @@
 <!-- ════════════ GLOBAL ACTION BUTTONS ════════════ -->
 <div id="global-actions" style="margin-bottom:40px;">
     <button id="btn-add-batch"    class="batch-btn" onclick="addToBatch()">📦 + Add Current Routine to Batch</button>
-    <button id="btn-add-all-batch" class="batch-btn" onclick="addAllToBatch()" style="margin-top:6px;">📦 + Add All Saved Routines to Batch</button>
     <button id="btn-send-single"  style="padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2);" onclick="saveAndSendSingle()">Save &amp; Send Single Routine to Watch</button>
     <button id="btn-send-google"  style="display:none; padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2); background:var(--green);" onclick="saveAndSendSingle()">☁️ Save Google Settings to Watch</button>
-    <p style="font-size:12px; color:gray; margin:8px 0 0;">Sending transfers data to the watch, so this page will close automatically — that's expected. Reopen it to edit more.</p>
 </div>
 
 <script>
@@ -1016,10 +1014,8 @@ function validateRoutineForSend(name) {
     return validateLinkedSetForSend(myRoutine, name);
 }
 
-function serialiseRoutine(name, exercises, progressionMode, weightIncrement) {
-    const progMode = progressionMode !== undefined ? progressionMode : document.getElementById('progressionMode').value;
-    const weightInc = weightIncrement !== undefined ? weightIncrement : document.getElementById('weightIncrement').value;
-    let s = `${name}|${progMode}|${weightInc}`;
+function serialiseRoutine(name, exercises) {
+    let s = name;
     exercises.forEach(ex => {
         const mod = ex.length > 4 ? ex[4] : 0;
         const cmt = (ex.length > 5 && ex[5].trim() !== '') ? ex[5].trim() : '-';
@@ -1055,22 +1051,9 @@ function buildConfigPayload(routineData) {
 function sendToPebble(configData) {
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
     const encoded  = encodeURIComponent(JSON.stringify(configData));
-    console.log('sendToPebble: encoded.length=' + encoded.length);
     if (encoded.length > MAX_CONFIG_RESPONSE) {
         alert(`⚠️ Settings payload is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer (longer responses are silently dropped and never reach the watch). Please shorten exercise names/comments or split the routine.`);
         return;
-    }
-    window.location.href = returnTo + encoded;
-}
-
-function sendRawToPebble(syncString) {
-    _hasNavigated = true;
-    const returnTo = getQueryParam('return_to', 'pebblejs://close#');
-
-    const encoded  = encodeURIComponent(syncString);
-    console.log('sendRawToPebble: encoded.length=' + encoded.length + ' (routines are split into chunks by pkjs when needed)');
-    if (encoded.length > MAX_CONFIG_RESPONSE) {
-        console.log(`Routine is ${encoded.length} encoded chars — pkjs will chunk it automatically.`);
     }
     window.location.href = returnTo + encoded;
 }
@@ -1146,53 +1129,23 @@ function saveAndSendSingle() {
         return;
     }
 
-    // Snapshot synced state BEFORE saveRoutineToStorage — on some branches
-    // (issue #46 fix) saveRoutineToStorage overwrites syncedRoutinesDict[name],
-    // which would make routineMatchesSyncedCopy always return true and strip
-    // exercises from the payload.
-    const syncedSnapshot = { ...syncedRoutinesDict };
+    // If the routine is unchanged from the watch's last synced copy, send
+    // only the progression settings (tiny payload, always fits the transfer
+    // limit). Only re-transmit the full routine when it actually changed.
+    let routineStr = '';
+    if (myRoutine.length > 0 && !routineMatchesSyncedCopy(name)) {
+        routineStr = serialiseRoutine(name, myRoutine);
+        if (routineStr.length > MAX_ROUTINE_LEN) {
+            alert('⚠️ Routine too long! Please abbreviate some exercise names and try again.');
+            return;
+        }
+    }
 
     saveRoutineToStorage(name, myRoutine,
         document.getElementById('progressionMode').value,
         document.getElementById('weightIncrement').value);
     loadSavedRoutines();
-
-    let routineStr = '';
-    if (myRoutine.length > 0) {
-        if (syncedSnapshot[name] && routineMatchesSyncedCopy(name)) {
-            const progMode = document.getElementById('progressionMode').value;
-            const weightInc = document.getElementById('weightIncrement').value;
-            routineStr = `${name}|${progMode}|${weightInc}`;
-        } else {
-            routineStr = serialiseRoutine(name, myRoutine);
-        }
-    }
-
-    const payload = {};
-    const googleUrl = document.getElementById('googleUrlInput').value;
-    const googlePwd = document.getElementById('googlePwdInput').value;
-    if (routineStr)          payload.routineData = routineStr;
-    if (googleUrl)           payload.googleUrl  = googleUrl;
-    if (googlePwd)           payload.googlePwd  = googlePwd;
-    if (shouldClearHistory)  payload.clearHistory = true;
-    if (shouldClearGoogle)   payload.clearGoogle  = true;
-
-    // CRITICAL: set window.location EXACTLY ONCE per save.
-    // The pebblejs://close# navigation fires webviewclosed in pkjs; a SECOND
-    // navigation overrides the first, so the LAST response wins and the
-    // routine is silently lost ("nothing arrives on the watch" bug).
-    //
-    // If there is a routine to transmit, send it as a raw sync string (single
-    // navigation). pkjs then chunks it into CHUNK_TRANSFER app messages.
-    // Google url/password are already persisted in pkjs localStorage from the
-    // previous config session, so they are NOT re-sent here (avoids the
-    // double-navigation). clear flags are rare, deliberate actions handled
-    // by their own buttons; if a routine is also pending, the routine wins.
-    if (routineStr) {
-        sendRawToPebble(routineStr);
-    } else if (Object.keys(payload).length > 0) {
-        sendToPebble(payload);
-    }
+    sendToPebble(buildConfigPayload(routineStr));
 }
 
 // ============================================================
@@ -1226,28 +1179,6 @@ function addToBatch() {
     alert(`✅ '${name}' added to batch! (${batchRoutines.length}/${MAX_BATCH})`);
 }
 
-function addAllToBatch() {
-    const saved = getSavedRoutines();
-    if (saved.length === 0) return alert('No saved routines to add.');
-
-    let added = 0;
-    for (const routine of saved) {
-        if (batchRoutines.length >= MAX_BATCH) break;
-        // Skip corrupt/stale entries (empty name, no exercises) so they don't
-        // propagate a phantom routine (e.g. "2") to the watch.
-        if (!routine.name || !Array.isArray(routine.exercises) || routine.exercises.length === 0) continue;
-        if (batchRoutines.some(b => b.name === routine.name)) continue; // skip dupes
-        const dataStr = serialiseRoutine(routine.name, routine.exercises,
-            routine.progressionMode || '-1', routine.weightIncrement || '2');
-        if (dataStr.length > MAX_ROUTINE_LEN) continue; // skip oversized
-        batchRoutines.push({ name: routine.name, dataStr });
-        added++;
-    }
-    renderBatchUI();
-    if (added === 0) return alert('No new routines could be added (all already in batch or too long).');
-    alert(`✅ ${added} routine(s) added to batch! (${batchRoutines.length}/${MAX_BATCH})`);
-}
-
 function renderBatchUI() {
     document.getElementById('batchCount').innerText = `${batchRoutines.length} / ${MAX_BATCH} Routines Prepared`;
     const listDiv = document.getElementById('batchList');
@@ -1272,13 +1203,8 @@ function sendBatchToPebble() {
     if (batchRoutines.length === 0) {
         alert('Your batch is empty! Add routines from the Builder first.'); return;
     }
-    const confirmMsg =
-        `Send ${batchRoutines.length} routine(s) to the watch?\n\n` +
-        `Warning: this REPLACES your entire routine library on the watch. ` +
-        `Any routines already on the watch that are not in this batch will be removed.`;
-    if (!window.confirm(confirmMsg)) return;
     const finalStr = 'BATCH~' + batchRoutines.map(r => r.dataStr).join('~');
-    sendRawToPebble(finalStr);
+    sendToPebble(buildConfigPayload(finalStr));
 }
 
 // ============================================================
@@ -1312,37 +1238,9 @@ function importFromText() {
     if (!raw) return;
     try {
         const data = JSON.parse(raw);
-
-        // Bulk import: array of routines
-        if (Array.isArray(data)) {
-            let count = 0;
-            const importedSyncParts = [];
-            data.forEach(item => {
-                if (item.n && Array.isArray(item.e)) {
-                    const exercises = item.e.map(ex => { if (ex.length===4) ex.push(0); return migrateLegacyExercise(ex); });
-                    saveRoutineToStorage(item.n, exercises, '0', '2');
-                    importedSyncParts.push(serialiseRoutine(item.n, exercises, '0', '2'));
-                    count++;
-                }
-            });
-            loadSavedRoutines();
-            if (count === 0) return alert('⚠️ No valid routines found.');
-            document.getElementById('routineTextArea').value = '';
-
-            // Immediately send all imported routines to pkjs so they persist.
-            // Settings will close — reopen to continue.
-            if (!confirm(`✅ ${count} routine(s) imported!\n\nSettings will close to save them.`)) return;
-            const batchStr = 'BATCH~' + importedSyncParts.join('~');
-            sendRawToPebble(batchStr);
-            return;
-        }
-
-        // Single routine import (original behaviour)
         if (data.n && Array.isArray(data.e)) {
             document.getElementById('routineName').value = data.n;
             myRoutine = data.e.map(ex => { if (ex.length===4) ex.push(0); return migrateLegacyExercise(ex); });
-            document.getElementById('savedRoutineSelect').value = '';
-            selectedRoutineOriginalName = null;
             renderRoutine();
             alert('✅ Routine imported successfully!');
             document.getElementById('routineTextArea').value = '';
