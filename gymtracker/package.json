@@ -16,7 +16,8 @@
             "PROGRESSION_MODE",
             "WEIGHT_INCREMENT",
             "VOICE_ADD_EXERCISE",
-            "NEW_EXERCISE_DATA"
+            "NEW_EXERCISE_DATA",
+            "CHUNK_TRANSFER"
         ],
         "projectType": "native",
         "resources": {

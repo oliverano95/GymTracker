@@ -4,7 +4,7 @@ const path = require('path');
 
 module.exports = defineConfig({
   testDir: '.',
-  testMatch: ['test-config-page.js', 'emulator.js'],
+  testMatch: ['test-config-page.js', 'emulator.js', 'test-chunked-transfer.js', 'test-pkjs-chunking.js', 'test-beta-bugfix.js', 'test-c-parser.js'],
   timeout: 60_000,
   expect: { timeout: 5_000 },
   fullyParallel: false,
