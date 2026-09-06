@@ -1,0 +1,13 @@
+{
+  "name": "gymtracker-tests",
+  "private": true,
+  "scripts": {
+    "test": "npx playwright test",
+    "test:layer1": "npx playwright test --grep 'Layer 1'",
+    "test:layer2": "npx playwright test --grep 'Layer 2'",
+    "test:debug": "npx playwright test --headed --debug"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}
