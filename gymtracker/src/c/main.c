@@ -17,6 +17,15 @@
 #define GHOST_KEY_BASE     800
 #define LAST_COMPLETED_KEY_BASE 900
 
+// Pending-workout keys: an unsent export payload kept across reboots so an
+// offline session can be resent on reconnect. Key 700 holds the payload
+// length in bytes (absent means nothing pending); keys 701 and up hold the
+// payload itself in fixed-size chunks.
+#define PENDING_WORKOUT_LENGTH_KEY 700
+#define PENDING_WORKOUT_CHUNK_BASE 701
+#define PENDING_CHUNK_SIZE         256
+#define PENDING_MAX_CHUNKS         8
+
 #define NUM_VARIATIONS 9
 
 // Settings key offsets – named constants so inserting a new setting
@@ -269,6 +278,12 @@ static int       s_hr_series_count = 0;
 // Second outbound message buffer + sequencing flag for the two-message sync.
 static char s_sync_out_buf[EXPORT_BUF_SIZE];
 static bool s_sync_sent_summary = false;
+// True while a resent pending workout is in flight, so the sent callback
+// clears the pending record instead of starting a routine sync.
+// Offset in the export payload where the heart-rate series section starts;
+// persisting only up to here keeps the sets when storage is too full for all.
+static bool s_resend_in_flight = false;
+static int  s_pending_series_offset = 0;
 
 static void reset_set_hr(int ex_idx, int set_idx) {
   if (ex_idx < 0 || ex_idx >= MAX_EXERCISES) return;
@@ -1950,6 +1965,88 @@ static void summary_bg_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, GRect(mid + 5,  y_bot, box_w, box_h), 4, GCornersAll);
 }
 
+// ----------- Pending-workout store (offline resend) -----------
+static bool pending_workout_has(void) {
+  return persist_exists(PENDING_WORKOUT_LENGTH_KEY);
+}
+
+static void pending_workout_clear(void) {
+  persist_delete(PENDING_WORKOUT_LENGTH_KEY);
+  for (int i = 0; i < PENDING_MAX_CHUNKS; i++)
+    persist_delete(PENDING_WORKOUT_CHUNK_BASE + i);
+}
+
+// Stores exactly length bytes; splits into fixed chunks so no single write
+// exceeds a conservative size. Cleans up partial chunks on any failure.
+static bool pending_workout_store(const char *payload, int length) {
+  if (payload == NULL || length <= 0 || length >= EXPORT_BUF_SIZE) return false;
+  int chunks = (length + PENDING_CHUNK_SIZE - 1) / PENDING_CHUNK_SIZE;
+  if (chunks > PENDING_MAX_CHUNKS) return false;
+  for (int i = 0; i < chunks; i++) {
+    int part = length - i * PENDING_CHUNK_SIZE;
+    if (part > PENDING_CHUNK_SIZE) part = PENDING_CHUNK_SIZE;
+    if (persist_write_data(PENDING_WORKOUT_CHUNK_BASE + i,
+                           payload + i * PENDING_CHUNK_SIZE, part) != part) {
+      for (int j = 0; j < i; j++) persist_delete(PENDING_WORKOUT_CHUNK_BASE + j);
+      return false;
+    }
+  }
+  persist_write_int(PENDING_WORKOUT_LENGTH_KEY, length);
+  return true;
+}
+
+// Saves the export payload for a later resend. Falls back to the sets-only
+// prefix when the full payload (including the heart-rate series) does not
+// fit; the prefix alone is a valid legacy-shaped payload downstream.
+static bool pending_workout_save(const char *payload, int length, int series_offset) {
+  if (pending_workout_store(payload, length)) return true;
+  if (series_offset > 0 && series_offset < length)
+    return pending_workout_store(payload, series_offset);
+  return false;
+}
+
+// Resends the stored payload through the normal workout-summary message so
+// the phone side needs no changes. Only the log phase is resent; routine
+// progression already persisted locally when the payload was built.
+static void pending_workout_resend(void) {
+  if (!pending_workout_has()) return;
+  // Never clobber the live summary flow: its routine buffer doubles as our
+  // scratch space, and the menu only offers resends outside summary anyway.
+  if (s_app.ui.summary_window) return;
+  int length = persist_read_int(PENDING_WORKOUT_LENGTH_KEY);
+  if (length <= 0 || length >= EXPORT_BUF_SIZE) { pending_workout_clear(); return; }
+  int offset = 0;
+  int chunks = (length + PENDING_CHUNK_SIZE - 1) / PENDING_CHUNK_SIZE;
+  for (int i = 0; i < chunks; i++) {
+    int want = length - offset;
+    if (want > PENDING_CHUNK_SIZE) want = PENDING_CHUNK_SIZE;
+    // s_sync_out_buf is free scratch here: resends never run during summary.
+    if (persist_read_data(PENDING_WORKOUT_CHUNK_BASE + i,
+                          s_sync_out_buf + offset, want) != want) {
+      pending_workout_clear();
+      return;
+    }
+    offset += want;
+  }
+  s_sync_out_buf[length] = '\0';
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
+    dict_write_cstring(iter, MESSAGE_KEY_WORKOUT_SUMMARY, s_sync_out_buf);
+    app_message_outbox_send();
+    s_resend_in_flight = true;
+    s_sync_sent_summary = true;  // skip the routine phase on resends
+    vibes_short_pulse();
+  } else {
+    s_resend_in_flight = false;
+  }
+}
+
+// Resends on reconnect so an offline session uploads itself once the phone
+// is back; the main menu item below covers the rest.
+static void bluetooth_connection_handler(bool connected) {
+  if (connected && pending_workout_has()) pending_workout_resend();
+}
+
 static void summary_window_load(Window *window) {
   tick_timer_service_unsubscribe();
 
@@ -2142,6 +2239,9 @@ static void summary_window_load(Window *window) {
   // Append the session HR time-series (timestamped samples at the configured
   // interval) as a reserved "@HR" section so downstream parsers can split it
   // from the per-set data.
+  // Remember where the heart-rate series starts so a storage-short save can
+  // keep the sets-only prefix (valid legacy shape downstream).
+  s_pending_series_offset = offset;
   if (offset < limit - 1) {
     written = snprintf(export_buf + offset, limit - offset, "|@HR|");
     offset += (written > 0 && written < limit - offset) ? written : limit - offset - 1;
@@ -2185,18 +2285,29 @@ static void summary_window_load(Window *window) {
 
   // Split the two payloads into separate outbound messages so the workout
   // summary (now carrying per-set HR + the time-series) gets its own buffer.
+  // Keep the payload for a later resend before the single send attempt; the
+  // record is cleared once the full live sync is out.
+  pending_workout_save(export_buf, offset, s_pending_series_offset);
   DictionaryIterator *iter;
   if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
     dict_write_cstring(iter, MESSAGE_KEY_WORKOUT_SUMMARY, export_buf);
     app_message_outbox_send();
     s_sync_sent_summary = false;  // ROUTINE_DATA is sent from outbox_sent_callback
     text_layer_set_text(s_app.ui.sum_info_layer, celebration_buf);
+  } else if (pending_workout_has()) {
+    text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nWill retry.");
   } else {
     text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nCheck Bluetooth.");
   }
 }
 
 static void outbox_sent_callback(DictionaryIterator *iterator, void *context) {
+  // A resent pending workout is fully out once its single phase is sent.
+  if (s_resend_in_flight) {
+    s_resend_in_flight = false;
+    pending_workout_clear();
+    return;
+  }
   // First message (WORKOUT_SUMMARY) is out — follow up with ROUTINE_DATA.
   if (!s_sync_sent_summary) {
     s_sync_sent_summary = true;
@@ -2204,12 +2315,17 @@ static void outbox_sent_callback(DictionaryIterator *iterator, void *context) {
     if (app_message_outbox_begin(&iter2) == APP_MSG_OK) {
       dict_write_cstring(iter2, MESSAGE_KEY_ROUTINE_DATA, s_sync_out_buf);
       app_message_outbox_send();
+      pending_workout_clear();
     }
   }
 }
 
 static void outbox_failed_callback(DictionaryIterator *iterator, AppMessageResult reason, void *context) {
-  text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nCheck Bluetooth.");
+  s_resend_in_flight = false;
+  if (pending_workout_has())
+    text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nWill retry.");
+  else
+    text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nCheck Bluetooth.");
 }
 
 static void summary_window_unload(Window *window) {
@@ -3728,6 +3844,7 @@ static void push_workout_window(void) {
 static uint16_t menu_get_num_rows_callback(MenuLayer *ml, uint16_t section, void *data) {
   int rows = s_app.storage.active_slots;
   if (s_app.state.has_resume)              rows++;
+  if (pending_workout_has())               rows++;
   if (s_app.storage.active_slots < MAX_SLOTS) rows++;
   rows++; // Settings row
   return (uint16_t)rows;
@@ -3737,6 +3854,10 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
   int i = cell_index->row;
   if (s_app.state.has_resume) {
     if (i == 0) { menu_cell_basic_draw(ctx, cell_layer, "Resume Workout", "Continue where you left off", NULL); return; }
+    i--;
+  }
+  if (pending_workout_has()) {
+    if (i == 0) { menu_cell_basic_draw(ctx, cell_layer, "Resend Last Workout", "Send unsynced session", NULL); return; }
     i--;
   }
   if (i < s_app.storage.active_slots) {
@@ -3856,6 +3977,15 @@ static void menu_select_callback(MenuLayer *ml, MenuIndex *cell_index, void *dat
     i--;
   }
 
+  if (pending_workout_has()) {
+    if (i == 0) {
+      pending_workout_resend();
+      menu_layer_reload_data(s_app.ui.menu_layer);
+      return;
+    }
+    i--;
+  }
+
   if      (i < s_app.storage.active_slots) start_workout_from_slot(i);
   else if (i == s_app.storage.active_slots && s_app.storage.active_slots < MAX_SLOTS) {
     snprintf(s_shared_text_buffer, sizeof(s_shared_text_buffer), "Empty Slot\n\nOpen this app's settings on your phone to send a routine here.");
@@ -3867,6 +3997,10 @@ static void menu_select_callback(MenuLayer *ml, MenuIndex *cell_index, void *dat
 static void menu_select_long_callback(MenuLayer *ml, MenuIndex *cell_index, void *data) {
   int i = cell_index->row;
   if (s_app.state.has_resume) {
+    if (i == 0) return;
+    i--;
+  }
+  if (pending_workout_has()) {
     if (i == 0) return;
     i--;
   }
@@ -4165,6 +4299,12 @@ static void init(void) {
   // 2048 inbox for our 1300-byte routines; 2048 outbox for the workout summary
   // (which now carries per-set HR + the HR time-series).
   app_message_open(2048, 2048);
+
+  // Offline resend: a pending workout uploads itself on reconnect, and any
+  // reboot with the phone nearby clears it immediately.
+  bluetooth_connection_service_subscribe(bluetooth_connection_handler);
+  if (bluetooth_connection_service_peek() && pending_workout_has())
+    pending_workout_resend();
 }
 
 static void deinit(void) {
