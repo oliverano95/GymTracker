@@ -370,6 +370,11 @@ static void mega_window_load(Window *window);
 static void mega_window_unload(Window *window);
 static void jump_window_load(Window *window);
 static void jump_window_unload(Window *window);
+// Wrap: generic steppers + unified provider (defined with the menus below).
+static void wrap_step_layer(MenuLayer *ml, uint16_t rows, int dir);
+static void wrap_step_simple(SimpleMenuLayer *sml, int n, int dir);
+static void simple_forward_select(SimpleMenuLayer *sml, SimpleMenuSection *sec);
+static void wrap_click_provider(void *context);
 static void workout_window_load(Window *window);
 static void workout_window_unload(Window *window);
 static void wo_click_provider(void *context);
@@ -1302,6 +1307,72 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 //                            9. UI WINDOWS                                  //
 // ========================================================================= //
 
+// ----------- Wrap helpers -----------
+// Wrap: modular step, +1 down / -1 up over `rows` rows; stays put when
+// rows <= 1 or cur is out of range.
+static int menu_wrap_next(int cur, int rows, int dir) {
+  if (rows <= 1) return cur < 0 ? 0 : cur;
+  if (cur < 0 || cur >= rows) return cur;
+  int step = (dir >= 0) ? 1 : -1;
+  return (cur + step + rows) % rows;
+}
+// Wrap: multi-section flattening for the settings menu.
+static int menu_flat_count(const int *sec_counts, int nsec) {
+  int total = 0;
+  for (int s = 0; s < nsec; s++) total += sec_counts[s] > 0 ? sec_counts[s] : 0;
+  return total;
+}
+static int menu_flat_of(const int *sec_counts, int nsec, int sec, int row) {
+  if (nsec <= 0) return 0;
+  if (sec < 0) return 0;
+  if (sec >= nsec) sec = nsec - 1;
+  int flat = 0;
+  for (int s = 0; s < sec; s++) flat += sec_counts[s] > 0 ? sec_counts[s] : 0;
+  int rows = sec_counts[sec] > 0 ? sec_counts[sec] : 0;
+  if (row < 0) row = 0;
+  if (rows > 0 && row >= rows) row = rows - 1;
+  return flat + (rows > 0 ? row : 0);
+}
+static void menu_pair_of(const int *sec_counts, int nsec, int flat, int *sec, int *row) {
+  if (nsec <= 0) { *sec = 0; *row = 0; return; }
+  if (flat < 0) { *sec = 0; *row = 0; return; }
+  for (int s = 0; s < nsec; s++) {
+    int rows = sec_counts[s] > 0 ? sec_counts[s] : 0;
+    if (flat < rows) { *sec = s; *row = flat; return; }
+    flat -= rows;
+  }
+  for (int s = nsec - 1; s >= 0; s--) {
+    int rows = sec_counts[s] > 0 ? sec_counts[s] : 0;
+    if (rows > 0) { *sec = s; *row = rows - 1; return; }
+  }
+  *sec = 0; *row = 0;
+}
+// Wrap: single-section step over any MenuLayer; adjacent moves animate via
+// set_selected_next, wraps jump directly to the other end.
+static void wrap_step_layer(MenuLayer *ml, uint16_t rows, int dir) {
+  if (!ml || rows == 0) return;
+  MenuIndex cur = menu_layer_get_selected_index(ml);
+  int next = menu_wrap_next(cur.row, rows, dir);
+  if (next == cur.row + dir)
+    menu_layer_set_selected_next(ml, dir < 0, MenuRowAlignCenter, true);
+  else
+    menu_layer_set_selected_index(ml, MenuIndex(0, (uint16_t)next), MenuRowAlignCenter, true);
+}
+// Wrap: SimpleMenuLayer step; the SDK tracks selection itself.
+static void wrap_step_simple(SimpleMenuLayer *sml, int n, int dir) {
+  if (!sml || n <= 0) return;
+  int next = menu_wrap_next(simple_menu_layer_get_selected_index(sml), n, dir);
+  simple_menu_layer_set_selected_index(sml, next, true);
+}
+// Wrap: with a manual window provider the stock select handling is replaced,
+// so invoke the highlighted item ourselves (item callbacks ignore ctx).
+static void simple_forward_select(SimpleMenuLayer *sml, SimpleMenuSection *sec) {
+  if (!sml || !sec || sec->num_items <= 0) return;
+  int idx = simple_menu_layer_get_selected_index(sml);
+  if (idx < 0 || idx >= (int)sec->num_items) return;
+  if (sec->items[idx].callback) sec->items[idx].callback(idx, NULL);
+}
+
 // ----------- Settings Window -----------
 static uint16_t settings_get_num_sections_callback(MenuLayer *ml, void *data) { return 5; }
 static uint16_t settings_get_num_rows_callback(MenuLayer *ml, uint16_t section, void *data) {
@@ -1554,6 +1625,38 @@ static void settings_select_long_callback(MenuLayer *ml, MenuIndex *cell_index, 
   push_help_window();
 }
 
+// Wrap: multi-section — flatten over the section counts, step, map back.
+static void settings_wrap_step(int dir) {
+  MenuLayer *ml = s_app.ui.settings_menu_layer;
+  if (!ml) return;
+  int nsec = settings_get_num_sections_callback(ml, NULL);
+  if (nsec <= 0 || nsec > 8) return;
+  int secs[8];
+  for (int s = 0; s < nsec; s++) secs[s] = settings_get_num_rows_callback(ml, (uint16_t)s, NULL);
+  MenuIndex cur = menu_layer_get_selected_index(ml);
+  int cur_flat = menu_flat_of(secs, nsec, cur.section, cur.row);
+  int total = menu_flat_count(secs, nsec);
+  int next = menu_wrap_next(cur_flat, total, dir);
+  int ns, nr;
+  menu_pair_of(secs, nsec, next, &ns, &nr);
+  if (next == cur_flat + dir)
+    menu_layer_set_selected_next(ml, dir < 0, MenuRowAlignCenter, true);
+  else
+    menu_layer_set_selected_index(ml, MenuIndex((uint16_t)ns, (uint16_t)nr), MenuRowAlignCenter, true);
+}
+static void settings_wrap_do_select(void) {
+  MenuLayer *ml = s_app.ui.settings_menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  settings_select_callback(ml, &idx, NULL);
+}
+static void settings_wrap_do_long(void) {
+  MenuLayer *ml = s_app.ui.settings_menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  settings_select_long_callback(ml, &idx, NULL);
+}
+
 static void settings_window_load(Window *window) {
   Layer *w_layer = window_get_root_layer(window);
   GRect bounds   = layer_get_bounds(w_layer);
@@ -1578,7 +1681,7 @@ static void settings_window_load(Window *window) {
   });
   menu_layer_set_normal_colors(s_app.ui.settings_menu_layer,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(s_app.ui.settings_menu_layer, get_theme_color(), get_bg_color());
-  menu_layer_set_click_config_onto_window(s_app.ui.settings_menu_layer, window);
+  window_set_click_config_provider(window, wrap_click_provider);
   layer_add_child(w_layer, menu_layer_get_layer(s_app.ui.settings_menu_layer));
 }
 
@@ -1882,6 +1985,16 @@ static void sensation_select_callback(MenuLayer *ml, MenuIndex *cell_index, void
   push_summary_window();
   window_stack_remove(s_app.ui.sensation_window, false);
 }
+// Wrap: single-section, 5 rows.
+static void sensation_wrap_step(int dir) {
+  wrap_step_layer(s_app.ui.sensation_menu_layer, sensation_get_num_rows_callback(NULL, 0, NULL), dir);
+}
+static void sensation_wrap_do_select(void) {
+  MenuLayer *ml = s_app.ui.sensation_menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  sensation_select_callback(ml, &idx, NULL);
+}
 static void sensation_window_load(Window *window) {
   Layer *w_layer = window_get_root_layer(window);
   GRect bounds   = layer_get_bounds(w_layer);
@@ -1893,7 +2006,7 @@ static void sensation_window_load(Window *window) {
   });
   menu_layer_set_normal_colors(s_app.ui.sensation_menu_layer,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(s_app.ui.sensation_menu_layer, get_theme_color(), get_bg_color());
-  menu_layer_set_click_config_onto_window(s_app.ui.sensation_menu_layer, window);
+  window_set_click_config_provider(window, wrap_click_provider);
   layer_add_child(w_layer, menu_layer_get_layer(s_app.ui.sensation_menu_layer));
 }
 static void sensation_window_unload(Window *window) { menu_layer_destroy(s_app.ui.sensation_menu_layer); }
@@ -2272,6 +2385,16 @@ static void variation_select_callback(MenuLayer *ml, MenuIndex *cell_index, void
   update_workout_ui(false);
   window_stack_pop(true);
 }
+// Wrap: single-section, NUM_VARIATIONS rows.
+static void variation_wrap_step(int dir) {
+  wrap_step_layer(s_app.ui.variation_menu_layer, variation_get_num_rows_callback(NULL, 0, NULL), dir);
+}
+static void variation_wrap_do_select(void) {
+  MenuLayer *ml = s_app.ui.variation_menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  variation_select_callback(ml, &idx, NULL);
+}
 static void variation_window_load(Window *window) {
   Layer *w_layer = window_get_root_layer(window);
   GRect bounds   = layer_get_bounds(w_layer);
@@ -2283,7 +2406,7 @@ static void variation_window_load(Window *window) {
   });
   menu_layer_set_normal_colors(s_app.ui.variation_menu_layer,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(s_app.ui.variation_menu_layer, get_theme_color(), get_bg_color());
-  menu_layer_set_click_config_onto_window(s_app.ui.variation_menu_layer, window);
+  window_set_click_config_provider(window, wrap_click_provider);
   layer_add_child(w_layer, menu_layer_get_layer(s_app.ui.variation_menu_layer));
 }
 static void variation_window_unload(Window *window) { menu_layer_destroy(s_app.ui.variation_menu_layer); }
@@ -2498,10 +2621,20 @@ static void ex_action_window_load(Window *window) {
   menu_layer_set_highlight_colors(internal, get_theme_color(), get_bg_color());
 
   layer_add_child(w_layer, simple_menu_layer_get_layer(s_app.ui.ex_action_menu_layer));
+  // Wrap: provider LAST — stock config installs at create.
+  window_set_click_config_provider(window, wrap_click_provider);
 }
 
 static void ex_action_window_unload(Window *window) {
   simple_menu_layer_destroy(s_app.ui.ex_action_menu_layer);
+}
+
+// Wrap: Move Up / Move Down / Delete.
+static void ex_action_wrap_step(int dir) {
+  wrap_step_simple(s_app.ui.ex_action_menu_layer, s_app.ui.ex_action_menu_sections[0].num_items, dir);
+}
+static void ex_action_wrap_do_select(void) {
+  simple_forward_select(s_app.ui.ex_action_menu_layer, &s_app.ui.ex_action_menu_sections[0]);
 }
 
 static void push_ex_action_window(void) {
@@ -2536,6 +2669,16 @@ static void inspector_select_callback(MenuLayer *ml, MenuIndex *cell_index, void
   s_app.storage.exercise_to_edit = cell_index->row;
   push_ex_action_window();
 }
+// Wrap: single-section, exercise count rows.
+static void inspector_wrap_step(int dir) {
+  wrap_step_layer(s_app.ui.inspector_menu_layer, inspector_get_num_rows_callback(NULL, 0, NULL), dir);
+}
+static void inspector_wrap_do_select(void) {
+  MenuLayer *ml = s_app.ui.inspector_menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  inspector_select_callback(ml, &idx, NULL);
+}
 static void inspector_window_load(Window *window) {
   Layer *w_layer = window_get_root_layer(window);
   GRect bounds   = layer_get_bounds(w_layer);
@@ -2547,7 +2690,7 @@ static void inspector_window_load(Window *window) {
   });
   menu_layer_set_normal_colors(s_app.ui.inspector_menu_layer,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(s_app.ui.inspector_menu_layer, get_theme_color(), get_bg_color());
-  menu_layer_set_click_config_onto_window(s_app.ui.inspector_menu_layer, window);
+  window_set_click_config_provider(window, wrap_click_provider);
   layer_add_child(w_layer, menu_layer_get_layer(s_app.ui.inspector_menu_layer));
 }
 static void inspector_window_unload(Window *window) {
@@ -2647,6 +2790,8 @@ static void action_window_load(Window *window) {
   menu_layer_set_normal_colors(internal,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(internal, get_theme_color(), get_bg_color());
   layer_add_child(w_layer, simple_menu_layer_get_layer(s_app.ui.action_menu_layer));
+  // Wrap: provider LAST — stock config installs at create.
+  window_set_click_config_provider(window, wrap_click_provider);
 }
 static void action_quick_add_callback(int index, void *ctx) {
   window_stack_remove(s_app.ui.action_window, false);
@@ -2657,6 +2802,13 @@ static void action_quick_add_callback(int index, void *ctx) {
   dictation_session_start(s_app.state.new_ex_dictation_session);
 }
 static void action_window_unload(Window *window) { simple_menu_layer_destroy(s_app.ui.action_menu_layer); }
+// Wrap: fixed items, SDK-tracked selection.
+static void action_wrap_step(int dir) {
+  wrap_step_simple(s_app.ui.action_menu_layer, s_app.ui.action_menu_sections[0].num_items, dir);
+}
+static void action_wrap_do_select(void) {
+  simple_forward_select(s_app.ui.action_menu_layer, &s_app.ui.action_menu_sections[0]);
+}
 static void push_action_window(void) {
   if (!s_app.ui.action_window) {
     s_app.ui.action_window = window_create();
@@ -2711,6 +2863,8 @@ static void mega_window_load(Window *window) {
   menu_layer_set_normal_colors(internal,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(internal, get_theme_color(), get_bg_color());
   layer_add_child(w_layer, simple_menu_layer_get_layer(s_app.ui.mega_menu_layer));
+  // Wrap: provider LAST — stock config installs at create.
+  window_set_click_config_provider(window, wrap_click_provider);
 }
 static void menu_quick_add_callback(int index, void *ctx) {
   window_stack_remove(s_app.ui.mega_window, false);
@@ -2721,6 +2875,13 @@ static void menu_quick_add_callback(int index, void *ctx) {
   dictation_session_start(s_app.state.new_ex_dictation_session);
 }
 static void mega_window_unload(Window *window) { simple_menu_layer_destroy(s_app.ui.mega_menu_layer); }
+// Wrap: fixed items (count read off the live section).
+static void mega_wrap_step(int dir) {
+  wrap_step_simple(s_app.ui.mega_menu_layer, s_app.ui.mega_menu_sections[0].num_items, dir);
+}
+static void mega_wrap_do_select(void) {
+  simple_forward_select(s_app.ui.mega_menu_layer, &s_app.ui.mega_menu_sections[0]);
+}
 static void push_mega_window(void) {
   if (!s_app.ui.mega_window) {
     s_app.ui.mega_window = window_create();
@@ -2729,6 +2890,57 @@ static void push_mega_window(void) {
   }
   window_set_background_color(s_app.ui.mega_window, get_bg_color());
   window_stack_push(s_app.ui.mega_window, true);
+}
+// Wrap: one manual click provider serves every wrappable menu window —
+// separate provider copies overflowed the flint 64KB app region. Per-menu
+// step/select stay explicit above; this table binds them to windows. BACK
+// is never subscribed (system pop). Long-press only acts on Settings;
+// elsewhere the long subscription is a harmless no-op.
+typedef struct { Window **win; void (*step)(int dir); void (*select)(void); } WrapTarget;
+static const WrapTarget s_wrap_targets[] = {
+  { &s_app.ui.settings_window, settings_wrap_step, settings_wrap_do_select },
+  { &s_app.ui.sensation_window, sensation_wrap_step, sensation_wrap_do_select },
+  { &s_app.ui.variation_window, variation_wrap_step, variation_wrap_do_select },
+  { &s_app.ui.inspector_window, inspector_wrap_step, inspector_wrap_do_select },
+  { &s_app.ui.action_window, action_wrap_step, action_wrap_do_select },
+  { &s_app.ui.mega_window, mega_wrap_step, mega_wrap_do_select },
+  { &s_app.ui.ex_action_window, ex_action_wrap_step, ex_action_wrap_do_select },
+};
+static const WrapTarget *wrap_target_for_top(void) {
+  Window *top = window_stack_get_top_window();
+  for (unsigned i = 0; i < sizeof(s_wrap_targets) / sizeof(s_wrap_targets[0]); i++)
+    if (top && top == *s_wrap_targets[i].win) return &s_wrap_targets[i];
+  return NULL;
+}
+static void wrap_up_click(ClickRecognizerRef r, void *ctx) {
+  (void)r; (void)ctx;
+  const WrapTarget *t = wrap_target_for_top();
+  if (t) t->step(-1);
+}
+static void wrap_down_click(ClickRecognizerRef r, void *ctx) {
+  (void)r; (void)ctx;
+  const WrapTarget *t = wrap_target_for_top();
+  if (t) t->step(+1);
+}
+static void wrap_select_click(ClickRecognizerRef r, void *ctx) {
+  (void)r; (void)ctx;
+  const WrapTarget *t = wrap_target_for_top();
+  if (t) t->select();
+}
+static void wrap_select_long_click(ClickRecognizerRef r, void *ctx) {
+  (void)r; (void)ctx;
+  Window *top = window_stack_get_top_window();
+  if (top && top == s_app.ui.settings_window) settings_wrap_do_long();
+}
+static void wrap_click_provider(void *context) {
+  (void)context;
+  if (!wrap_target_for_top()) return;
+  window_single_click_subscribe(BUTTON_ID_UP, wrap_up_click);
+  window_single_click_subscribe(BUTTON_ID_DOWN, wrap_down_click);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, 100, wrap_up_click);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 100, wrap_down_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, wrap_select_click);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 500, wrap_select_long_click, NULL);
 }
 
 // ----------- Workout Window -----------
@@ -3725,6 +3937,47 @@ static void push_workout_window(void) {
 }
 
 // ----------- Main Menu Window -----------
+// Wrap: +1 down, -1 up; wraps at the ends.
+static void menu_wrap_step(int dir) {
+  MenuLayer *ml = s_app.ui.menu_layer;
+  if (!ml) return;
+  MenuIndex cur = menu_layer_get_selected_index(ml);
+  int rows = menu_get_num_rows_callback(ml, 0, NULL);
+  int next = menu_wrap_next(cur.row, rows, dir);
+  if (next == cur.row + dir)
+    menu_layer_set_selected_next(ml, dir < 0, MenuRowAlignCenter, true);
+  else
+    menu_layer_set_selected_index(ml, MenuIndex(0, (uint16_t)next), MenuRowAlignCenter, true);
+}
+static void menu_wrap_up_click(ClickRecognizerRef r, void *ctx) { (void)r; (void)ctx; menu_wrap_step(-1); }
+static void menu_wrap_down_click(ClickRecognizerRef r, void *ctx) { (void)r; (void)ctx; menu_wrap_step(+1); }
+static void menu_wrap_select_click(ClickRecognizerRef r, void *ctx) {
+  (void)r; (void)ctx;
+  MenuLayer *ml = s_app.ui.menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  menu_select_callback(ml, &idx, NULL);
+}
+static void menu_wrap_select_long_click(ClickRecognizerRef r, void *ctx) {
+  (void)r; (void)ctx;
+  MenuLayer *ml = s_app.ui.menu_layer;
+  if (!ml) return;
+  MenuIndex idx = menu_layer_get_selected_index(ml);
+  menu_select_long_callback(ml, &idx, NULL);
+}
+// Wrap: fully manual click config — the stock onto_window provider cannot be
+// extended by re-subscribing after it, so every button is wired here. BACK
+// is left alone (system pop).
+static void main_wrap_click_provider(void *context) {
+  (void)context;
+  if (!s_app.ui.menu_layer || !s_app.ui.main_window) return;
+  window_single_click_subscribe(BUTTON_ID_UP, menu_wrap_up_click);
+  window_single_click_subscribe(BUTTON_ID_DOWN, menu_wrap_down_click);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, 100, menu_wrap_up_click);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 100, menu_wrap_down_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, menu_wrap_select_click);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 500, menu_wrap_select_long_click, NULL);
+}
 static uint16_t menu_get_num_rows_callback(MenuLayer *ml, uint16_t section, void *data) {
   int rows = s_app.storage.active_slots;
   if (s_app.state.has_resume)              rows++;
@@ -3898,7 +4151,7 @@ static void main_window_load(Window *window) {
   });
   menu_layer_set_normal_colors(s_app.ui.menu_layer,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(s_app.ui.menu_layer, get_theme_color(), get_bg_color());
-  menu_layer_set_click_config_onto_window(s_app.ui.menu_layer, window);
+  window_set_click_config_provider(window, main_wrap_click_provider);
 
   if (s_app.storage.active_slots > 0) {
     int next_slot = s_app.settings.last_routine_slot + 1;

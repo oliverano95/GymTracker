@@ -82,7 +82,7 @@ We have built a fully automated Google Sheets Dashboard that calculates your Est
 
 **Step 1: Copy the Template**
 
-1. Click here to automatically generate a private copy of the template in your Google Drive: **[Make a copy of the GymTracker Dashboard](https://docs.google.com/spreadsheets/d/1q1e9-1S2uV3sHKjfkFm6MOGQmd1c9ECmW8MesW6bG9w/copy)**
+1. Click here to automatically generate a private copy of the template in your Google Drive: **[Make a copy of the GymTracker Dashboard](https://docs.google.com/spreadsheets/d/1OMDMDUWcBv-GxIOSn7Y4pr-RS03WCVGdcy6IUYD48H4/copy)**
 
 **Step 2: Secure Your Script**
 

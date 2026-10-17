@@ -307,6 +307,7 @@
         <input type="text"     id="googleUrlInput" placeholder="https://script.google.com/macros/s/.../exec">
         <label>Export Password:</label>
         <input type="password" id="googlePwdInput" placeholder="Your secret password">
+        <button type="button" onclick="exportRoutinesToCSV()" style="width:100%; padding:12px; margin-top:12px; background:var(--green); color:white; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer;">Export Routines to CSV</button>
     </div>
 </div>
 
@@ -1116,6 +1117,72 @@ function routineMatchesSyncedCopy(name) {
 }
 
 // ============================================================
+// MANUAL ROUTINE EXPORT  (CSV backup)
+// ============================================================
+function getAllRoutineDefinitions() {
+    const routines = getSavedRoutines();
+    const definitions = {};
+    const deleted = Storage.getJSON('deletedSyncKeys', []);
+
+    routines.forEach(r => {
+        if (deleted.includes(r.name)) return;
+        const parts = [r.name, r.progressionMode || '-1', r.weightIncrement || '2'];
+        (r.exercises || []).forEach(ex => {
+            parts.push(ex.map(v => v === undefined || v === null ? '' : v).join(':'));
+        });
+        definitions[r.name] = parts.join('|');
+    });
+
+    return definitions;
+}
+
+function exportRoutinesToCSV() {
+    // Reuse the already-configured Google endpoint: typed value → URL query
+    // param (pkjs injects googleUrl/googlePwd on every config-page open) →
+    // localStorage. Matches the workout-export fallback so users aren't asked
+    // to re-enter an endpoint they've already configured.
+    const googleUrl = document.getElementById('googleUrlInput').value.trim()
+                   || getQueryParam('googleUrl', '').trim()
+                   || Storage.get('googleUrl', '');
+    const googlePwd = document.getElementById('googlePwdInput').value.trim()
+                   || getQueryParam('googlePwd', '').trim()
+                   || Storage.get('googlePwd', '');
+
+    if (!googleUrl || !googleUrl.trim()) {
+        alert('Please enter a Google Script URL first.');
+        return;
+    }
+    if (!googlePwd || !googlePwd.trim()) {
+        alert('Please enter an export password first.');
+        return;
+    }
+
+    const definitions = getAllRoutineDefinitions();
+    if (Object.keys(definitions).length === 0) {
+        alert('No routines to export.');
+        return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', googleUrl, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            alert('Routines exported successfully!');
+        } else {
+            alert('Export failed: ' + xhr.status);
+        }
+    };
+    xhr.onerror = function() {
+        alert('Network error. Check the URL.');
+    };
+    xhr.send(JSON.stringify({
+        token: googlePwd,
+        routineDefinitions: definitions
+    }));
+}
+
+// ============================================================
 // SINGLE SEND
 // ============================================================
 function saveAndSendSingle() {
@@ -1319,25 +1386,65 @@ function generateCSVBox() {
 
     const rows = ['Date,Routine,Duration (s),Mood,Accuracy (%),Density,Peak HR,Avg HR,Exercise,Set,Reps,Weight'];
     selected.forEach(entry => {
-        const parts    = entry.data.split('|');
+        const parts = entry.data.split('|');
+
+        // New format carries a reserved "@HR" time-series section and encodes
+        // each set as a 4-token tuple (reps, weight, set peak HR, set avg HR).
+        // Older workouts (no marker) used workout-wide Peak/Avg HR + 2-field sets.
+        const isNew = parts.includes('@HR');
+
         const routine  = parts[0] || 'Unknown';
         const date     = parts[1] || '';
         const duration = parts[2] || '0';
-        let mood = '', accuracy = '', density = '', peakHR = '', avgHR = '';
-        let startIndex = 3;
 
-        if (parts.length > 8 && !isNaN(parts[3])) {
-            [mood, accuracy, density, peakHR, avgHR] = [parts[3],parts[4],parts[5],parts[6],parts[7]];
+        let mood = '', accuracy = '', density = '';
+        let peakHR = '', avgHR = '';   // legacy fallback: workout-wide values
+        let startIndex;
+
+        if (isNew) {
+            [mood, accuracy, density] = [parts[3], parts[4], parts[5]];
+            startIndex = 6;
+        } else {
+            [mood, accuracy, density, peakHR, avgHR] = [parts[3], parts[4], parts[5], parts[6], parts[7]];
             startIndex = 8;
         }
 
         let currentExercise = '';
         let setNum = 1;
         for (let i = startIndex; i < parts.length; i++) {
-            if (isNaN(parts[i])) {
-                currentExercise = parts[i]; setNum = 1;
+            const token = parts[i];
+
+            if (token === '@HR') {
+                // Time-series lives in the next token: "sec,bpm;sec,bpm;...".
+                const series = parts[i + 1] || '';
+                if (series) {
+                    rows.push('');
+                    rows.push('HR Time Series');
+                    rows.push('Time (s),Heart Rate (BPM)');
+                    series.split(';').forEach(pair => {
+                        if (pair && pair.includes(',')) rows.push(pair);
+                    });
+                }
+                break;
+            }
+
+            if (token === '') { continue; }   // safety: skip stray empty tokens
+
+            if (isNaN(token)) {
+                currentExercise = token; setNum = 1;
+            } else if (isNew) {
+                // 4-token set: reps, weight, set peak HR, set avg HR
+                const reps    = token;
+                const weight  = parts[i + 1] !== undefined ? parts[i + 1] : '';
+                const setPeak = parts[i + 2] !== undefined ? parts[i + 2] : '';
+                const setAvg  = parts[i + 3] !== undefined ? parts[i + 3] : '';
+                rows.push(`${date},${routine},${duration},${mood},${accuracy},${density},${setPeak},${setAvg},${currentExercise},${setNum},${reps},${weight}`);
+                setNum++; i += 3;
             } else {
-                rows.push(`${date},${routine},${duration},${mood},${accuracy},${density},${peakHR},${avgHR},${currentExercise},${setNum},${parts[i]},${parts[i+1]}`);
+                // legacy 2-field set: reps, weight (Peak/Avg HR stay workout-wide)
+                const reps   = token;
+                const weight = parts[i + 1] !== undefined ? parts[i + 1] : '';
+                rows.push(`${date},${routine},${duration},${mood},${accuracy},${density},${peakHR},${avgHR},${currentExercise},${setNum},${reps},${weight}`);
                 setNum++; i++;
             }
         }
@@ -1563,6 +1670,14 @@ window.addEventListener('load', () => {
                     merged = true;
                 }
             }
+        }
+
+        // Voice-added exercises are appended by the watch at the end of the
+        // routine, so any sync entries beyond the local copy's length are
+        // new exercises and must be adopted rather than dropped.
+        for (let i = mergedExercises.length; i < syncExercises.length; i++) {
+            mergedExercises.push(migrateLegacyExercise(syncExercises[i]));
+            merged = true;
         }
 
         if (merged) {
