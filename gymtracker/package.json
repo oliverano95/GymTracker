@@ -15,8 +15,8 @@
             "WORKOUT_SUMMARY",
             "PROGRESSION_MODE",
             "WEIGHT_INCREMENT",
-            "VOICE_ADD_EXERCISE",
-            "NEW_EXERCISE_DATA"
+            "PROTO_MESSAGE",
+            "PROTO_ACK"
         ],
         "projectType": "native",
         "resources": {
@@ -44,5 +44,5 @@
             "watchface": false
         }
     },
-    "version": "6.18.0"
+    "version": "7.0.0"
 }

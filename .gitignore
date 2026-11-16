@@ -1,0 +1,11 @@
+# ---------------------------------------------------------------------------
+# Local-only notes and working documents.
+#
+# AGENTS.md and docs/ are development aids (agent instructions, protocol
+# design notes, SDK/emulator setup) rather than shipped project content.
+# Kept local so they are never published to the public repository.
+# Note: files already tracked in git history must also be removed from the
+# index (git rm --cached) — .gitignore alone only covers untracked files.
+# ---------------------------------------------------------------------------
+/AGENTS.md
+/docs/

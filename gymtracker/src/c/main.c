@@ -17,7 +17,35 @@
 #define GHOST_KEY_BASE     800
 #define LAST_COMPLETED_KEY_BASE 900
 
+// v7.0.0 keys (kept out of the ranges above so nothing is remapped).
+#define V7_SHORTCUT_MIGRATION_KEY   940
+#define PROTO_VERSION_KEY           941
+// Staged workout report: "<len>" + the payload, so an unacknowledged report can
+// be resent on reconnect/boot instead of being lost with Bluetooth.
+#define REPORT_STAGED_LEN_KEY       942
+#define REPORT_STAGED_BUF_KEY       943   // occupies 943..(943 + chunks)
+#define REPORT_STAGED_CHUNKS        4     // 4 x 256B = 1024B staged report
+
 #define NUM_VARIATIONS 9
+
+// ========================================================================= //
+// v7.0.0 wire protocol                                                     //
+// ------------------------------------------------------------------------- //
+// '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'                                 //
+// Everything travels as pipe-delimited text so the watch needs no JSON     //
+// parser. The envelope makes each message self-describing, carrying a      //
+// protocol version, a message id (for ACK/NAK) and chunk sequencing.       //
+// See docs/protocol.md for the full contract.                              //
+// ========================================================================= //
+#define PROTO_VERSION          1
+#define PROTO_CHUNK_PAYLOAD    512   // body chars per chunk (inbox/outbox are 2048)
+// Reassembly buffer size. Kept at the app's existing routine ceiling: a single
+// routine is at most MAX_ROUTINE_LEN (1300) in the config page. Batches are
+// reassembled one SEGMENT at a time by the config page/pkjs (each segment is
+// sent as its own 'R'), so the watch never needs to hold a whole batch in RAM.
+#define PROTO_MAX_CHUNKS       4     // 4 x 512 = 2048 bytes of reassembly buffer
+#define PROTO_MAX_RETRIES      3
+#define PROTO_IN_BUF_SIZE      (PROTO_CHUNK_PAYLOAD * PROTO_MAX_CHUNKS)
 
 // Settings key offsets – named constants so inserting a new setting
 // never silently remaps existing saved data.          FIX: named offsets
@@ -138,14 +166,11 @@ typedef struct {
   int temp_reps;
   int temp_weight;
   int sensation;
-  int adding_exercise_to_slot;
   int cached_completed_sets; // OPT #4: cached to avoid per-second loop
   int completed_sets[MAX_EXERCISES]; // jump-safe per-exercise completion
   bool hr_supported;         // OPT #2: checked once at workout start
   bool is_24h;               // OPT #8: cached once at workout start
   DictationSession *dictation_session;
-  DictationSession *new_ex_dictation_session;
-  Exercise pending_exercise;
   int note_toast_prev_ex_idx;
 } WorkoutState;
 
@@ -172,7 +197,7 @@ typedef struct {
   Window *main_window, *settings_window, *workout_window, *help_window, *confirm_window;
   Window *summary_window, *variation_window, *exit_window, *sensation_window;
   Window *action_window, *inspector_window, *mega_window, *jump_window;
-  Window *confirm_add_window, *ex_action_window;
+  Window *ex_action_window;
 
   MenuLayer *menu_layer, *settings_menu_layer, *variation_menu_layer;
   MenuLayer *sensation_menu_layer, *inspector_menu_layer, *jump_menu_layer;
@@ -206,12 +231,11 @@ typedef struct {
   TextLayer *confirm_text_layer, *sum_title_layer, *sum_info_layer, *exit_text_layer;
   TextLayer *rest_title_layer, *rest_time_layer, *rest_skip_layer, *rest_prep_layer;
   TextLayer *beat_layer, *missed_layer, *accuracy_layer, *density_layer;
-  TextLayer *confirm_add_text_layer;
 
   SimpleMenuSection action_menu_sections[1];
-  SimpleMenuItem action_menu_items[4];
+  SimpleMenuItem action_menu_items[3];
   SimpleMenuSection mega_menu_sections[1];
-  SimpleMenuItem mega_menu_items[10];
+  SimpleMenuItem mega_menu_items[9];
   SimpleMenuSection ex_action_menu_sections[1];
   SimpleMenuItem ex_action_menu_items[3];
 } AppUI;
@@ -266,9 +290,9 @@ static uint16_t s_set_hr_count[MAX_EXERCISES][10];
 static HRSample  s_hr_series[MAX_HR_SERIES];
 static int       s_hr_series_count = 0;
 
-// Second outbound message buffer + sequencing flag for the two-message sync.
-static char s_sync_out_buf[EXPORT_BUF_SIZE];
-static bool s_sync_sent_summary = false;
+// (v7.0.0) The old s_sync_out_buf "routine echo" buffer is gone: routine
+// definitions no longer travel watch -> phone. See section 9b for the
+// protocol buffers that replaced it.
 
 static void reset_set_hr(int ex_idx, int set_idx) {
   if (ex_idx < 0 || ex_idx >= MAX_EXERCISES) return;
@@ -385,12 +409,20 @@ static int  find_next_incomplete(void);
 static void refresh_directory(void);
 static void save_routine_to_slot(int slot_idx);
 
-static void new_exercise_dictation_callback(DictationSession *session, DictationSessionStatus status, char *transcription, void *context);
-static void action_quick_add_callback(int index, void *ctx);
-static void menu_quick_add_callback(int index, void *ctx);
-static void push_confirm_add_window(void);
 static void push_ex_action_window(void);
 static void push_timer_edit_window(void);
+
+// v7.0.0 protocol helpers
+static void proto_send(const char *type, const char *body);
+static void proto_send_ack(const char *id);
+static void proto_note_version(int ver);
+static void report_stage_and_send(void);
+static void report_retry_staged(void);
+static void report_clear_staged(void);
+
+// Referenced by code that is defined before section 9b.
+static void save_setting(SettingsKey key, int value);
+static char *report_stage_buf;
 
 // ========================================================================= //
 //                           5. CORE UTILITIES                               //
@@ -398,6 +430,16 @@ static void push_timer_edit_window(void);
 
 // FIX #11: Cache dark-theme result, updated once per minute by tick_handler.
 static bool s_dark_theme_cache = false;
+
+// v7.0.0: the shortcut action list lost "Add Ex. (Voice)" (old index 7), so
+// every action from there on moved down one slot. Old 8 (Add Set) -> 7,
+// old 9 (Jump) -> 8, and the now-meaningless old 7 (voice add) falls back to
+// Finish Set (4) rather than silently becoming a different action.
+static int migrate_shortcut_index(int old_idx) {
+  if (old_idx == 7) return 4;     // removed feature -> safe default
+  if (old_idx > 7)  return old_idx - 1;
+  return old_idx;                 // 0..6 unchanged
+}
 
 static void update_dark_theme_cache(struct tm *tick_time) {
   if (s_app.settings.dark_mode == 1) {
@@ -492,6 +534,20 @@ static void load_settings(void) {
   if (persist_exists(SETTINGS_KEY_BASE + SK_SWAP_UI))     s_app.settings.swap_reps_weight = persist_read_int(SETTINGS_KEY_BASE + SK_SWAP_UI);
   if (persist_exists(SETTINGS_KEY_BASE + SK_NOTE_TOAST))  s_app.settings.note_toast_mode  = persist_read_int(SETTINGS_KEY_BASE + SK_NOTE_TOAST);
   if (persist_exists(SETTINGS_KEY_BASE + SK_PREFILL_MODE))  s_app.settings.prefill_mode   = persist_read_int(SETTINGS_KEY_BASE + SK_PREFILL_MODE);
+
+  // v7.0.0 migration: "Add Ex. (Voice)" was removed from the shortcut action
+  // list, so every action index from the old slot 7 onwards shifted down by one.
+  // Old stored values >= 8 (Add Set / Jump) and 7 (the removed voice add) must
+  // be remapped, otherwise a user's saved shortcut silently changes meaning.
+  if (!persist_exists(V7_SHORTCUT_MIGRATION_KEY)) {
+    s_app.settings.shortcut_up     = migrate_shortcut_index(s_app.settings.shortcut_up);
+    s_app.settings.shortcut_down   = migrate_shortcut_index(s_app.settings.shortcut_down);
+    s_app.settings.shortcut_select = migrate_shortcut_index(s_app.settings.shortcut_select);
+    save_setting(SK_SHORTCUT_UP,   s_app.settings.shortcut_up);
+    save_setting(SK_SHORTCUT_DOWN, s_app.settings.shortcut_down);
+    save_setting(SK_SHORTCUT_SEL,  s_app.settings.shortcut_select);
+    persist_write_bool(V7_SHORTCUT_MIGRATION_KEY, true);
+  }
 }
 
 static void save_setting(SettingsKey key, int value) {
@@ -1117,17 +1173,6 @@ static void perform_voice_note(void) {
   dictation_session_start(s_app.state.dictation_session);
 }
 
-static void new_exercise_dictation_callback(DictationSession *session, DictationSessionStatus status, char *transcription, void *context) {
-  if (status == DictationSessionStatusSuccess) {
-    DictionaryIterator *iter;
-    if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
-      dict_write_cstring(iter, MESSAGE_KEY_VOICE_ADD_EXERCISE, transcription);
-      app_message_outbox_send();
-      vibes_short_pulse();
-    }
-  }
-}
-
 static void execute_shortcut(int action_idx) {
   if (s_app.state.is_resting && action_idx != 4 && action_idx != 5 && action_idx != 6) return;
   switch (action_idx) {
@@ -1145,16 +1190,10 @@ static void execute_shortcut(int action_idx) {
     case 5: perform_skip_set();   break;
     case 6: perform_voice_note(); break;
     case 7:
-      s_app.state.adding_exercise_to_slot = s_app.state.current_slot;
-      if (!s_app.state.new_ex_dictation_session) {
-        s_app.state.new_ex_dictation_session = dictation_session_create(128, new_exercise_dictation_callback, NULL);
-      }
-      dictation_session_start(s_app.state.new_ex_dictation_session);
+      // v7.0.0: was "Add Ex. (Voice)". Adding exercises is phone-only now.
+      add_extra_set();
       break;
-    case 8: 
-      add_extra_set(); 
-      break;
-    case 9:
+    case 8:
       push_jump_window();
       break;
   }
@@ -1303,13 +1342,14 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 // ========================================================================= //
 
 // ----------- Settings Window -----------
-static uint16_t settings_get_num_sections_callback(MenuLayer *ml, void *data) { return 5; }
+static uint16_t settings_get_num_sections_callback(MenuLayer *ml, void *data) { return 6; }
 static uint16_t settings_get_num_rows_callback(MenuLayer *ml, uint16_t section, void *data) {
   if (section == 0) return 5;
   if (section == 1) return 3;
   if (section == 2) return 1;
   if (section == 3) return 10;
   if (section == 4) return 3;
+  if (section == 5) return 1;   // v7.0.0: Phone Sync
   return 0;
 }
 static int16_t settings_get_header_height_callback(MenuLayer *ml, uint16_t section, void *data) {
@@ -1322,6 +1362,7 @@ static void settings_draw_header_callback(GContext *ctx, const Layer *cell_layer
     case 2: menu_cell_basic_header_draw(ctx, cell_layer, "Modifiers"); break;
     case 3: menu_cell_basic_header_draw(ctx, cell_layer, "System");    break;
     case 4: menu_cell_basic_header_draw(ctx, cell_layer, "Shortcuts"); break;
+    case 5: menu_cell_basic_header_draw(ctx, cell_layer, "Phone Sync"); break;
   }
 }
 
@@ -1404,12 +1445,20 @@ static void settings_draw_row_callback(GContext *ctx, const Layer *cell_layer,
       }
     }
   } else if (cell_index->section == 4) {
-    static const char *actions[] = {"Variations","View Note","Swap (Later)","Skip Entirely","Finish Set","Skip Set","Voice Note", "Add Ex. (Voice)", "Add Set", "Jump (Go To)"};
+    // v7.0.0: "Add Ex. (Voice)" was removed, so the action list is one shorter.
+    // Indices 0-6 are unchanged; old 8 (Add Set) -> 7 and old 9 (Jump) -> 8.
+    static const char *actions[] = {"Variations","View Note","Swap (Later)","Skip Entirely","Finish Set","Skip Set","Voice Note", "Add Set", "Jump (Go To)"};
     switch (cell_index->row) {
       case 0: snprintf(title, sizeof(title), "Up Long Press");     snprintf(subtitle, sizeof(subtitle), "%s", actions[s_app.settings.shortcut_up]);     break;
       case 1: snprintf(title, sizeof(title), "Down Long Press");   snprintf(subtitle, sizeof(subtitle), "%s", actions[s_app.settings.shortcut_down]);   break;
       case 2: snprintf(title, sizeof(title), "Select Long Press"); snprintf(subtitle, sizeof(subtitle), "%s", actions[s_app.settings.shortcut_select]); break;
     }
+  } else if (cell_index->section == 5) {
+    // v7.0.0: a workout that could not reach the phone is staged on the watch.
+    // This row lets the user push it manually (and shows whether one is waiting).
+    snprintf(title, sizeof(title), "Resend Last Workout");
+    snprintf(subtitle, sizeof(subtitle), "%s",
+             persist_exists(REPORT_STAGED_LEN_KEY) ? "Pending sync" : "Nothing pending");
   }
   menu_cell_basic_draw(ctx, cell_layer, title, subtitle, NULL);
 }
@@ -1490,9 +1539,17 @@ static void settings_select_callback(MenuLayer *ml, MenuIndex *cell_index, void 
     }
   } else if (cell_index->section == 4) {
     switch (cell_index->row) {
-      case 0: s_app.settings.shortcut_up++;     if (s_app.settings.shortcut_up     > 9) s_app.settings.shortcut_up     = 0; save_setting(SK_SHORTCUT_UP,   s_app.settings.shortcut_up);     break;
-      case 1: s_app.settings.shortcut_down++;   if (s_app.settings.shortcut_down   > 9) s_app.settings.shortcut_down   = 0; save_setting(SK_SHORTCUT_DOWN, s_app.settings.shortcut_down);   break;
-      case 2: s_app.settings.shortcut_select++; if (s_app.settings.shortcut_select > 9) s_app.settings.shortcut_select = 0; save_setting(SK_SHORTCUT_SEL,  s_app.settings.shortcut_select); break;
+      case 0: s_app.settings.shortcut_up++;     if (s_app.settings.shortcut_up     > 8) s_app.settings.shortcut_up     = 0; save_setting(SK_SHORTCUT_UP,   s_app.settings.shortcut_up);     break;
+      case 1: s_app.settings.shortcut_down++;   if (s_app.settings.shortcut_down   > 8) s_app.settings.shortcut_down   = 0; save_setting(SK_SHORTCUT_DOWN, s_app.settings.shortcut_down);   break;
+      case 2: s_app.settings.shortcut_select++; if (s_app.settings.shortcut_select > 8) s_app.settings.shortcut_select = 0; save_setting(SK_SHORTCUT_SEL,  s_app.settings.shortcut_select); break;
+    }
+  } else if (cell_index->section == 5) {
+    // v7.0.0: manual resend of a staged (never acknowledged) workout report.
+    if (persist_exists(REPORT_STAGED_LEN_KEY)) {
+      report_retry_staged();
+      vibes_short_pulse();
+    } else {
+      vibes_double_pulse();
     }
   }
   menu_layer_reload_data(s_app.ui.settings_menu_layer);
@@ -1547,6 +1604,8 @@ static void settings_select_long_callback(MenuLayer *ml, MenuIndex *cell_index, 
     }
   } else if (cell_index->section == 4) {
     tooltip = "Shortcuts:\nBind a specific action to a long-press of the Up, Down, or Select button during a workout.";
+  } else if (cell_index->section == 5) {
+    tooltip = "Phone Sync:\nWorkouts that cannot reach your phone are saved on the watch and sent automatically when it reconnects. Use this to resend manually.";
   }
 
   // Display the tooltip
@@ -1780,96 +1839,6 @@ static void push_exit_window(void) {
   }
   window_set_background_color(s_app.ui.exit_window, get_bg_color());
   window_stack_push(s_app.ui.exit_window, true);
-}
-
-// --- Confirm Add Exercise Window ---
-static void confirm_add_up_click(ClickRecognizerRef recognizer, void *context) {
-  // User clicked YES - Execute the save logic!
-  int slot_idx = s_app.state.adding_exercise_to_slot;
-  RoutineHeader header;
-
-  if (persist_exists(STORAGE_KEY_BASE + slot_idx)) {
-    persist_read_data(STORAGE_KEY_BASE + slot_idx, &header, sizeof(RoutineHeader));
-
-    if (header.total_exercises < MAX_EXERCISES) {
-      persist_write_data(ROUTINE_EX_BASE + (slot_idx * MAX_EXERCISES) + header.total_exercises, &s_app.state.pending_exercise, sizeof(Exercise));
-      header.total_exercises++;
-      persist_write_data(STORAGE_KEY_BASE + slot_idx, &header, sizeof(RoutineHeader));
-
-      // Inject into live workout if currently active
-      if (s_app.state.active && s_app.state.current_slot == slot_idx) {
-        s_app.state.exercises[s_app.state.total_exercises] = s_app.state.pending_exercise;
-        s_app.state.total_exercises++;
-        s_app.state.total_workout_sets += s_app.state.pending_exercise.target_sets;
-
-        // FIX: Safely check if the workout window is ACTUALLY loaded on screen
-        if (s_app.ui.workout_window && window_is_loaded(s_app.ui.workout_window)) {
-          update_workout_ui(false);
-          if (s_app.ui.progress_layer) layer_mark_dirty(s_app.ui.progress_layer);
-        }
-      }
-
-      refresh_directory();
-
-      // FIX: Only attempt to reload menus if their parent windows are currently alive
-      if (s_app.ui.menu_layer && window_is_loaded(s_app.ui.main_window)) {
-        menu_layer_reload_data(s_app.ui.menu_layer);
-      }
-      if (s_app.ui.inspector_menu_layer && window_is_loaded(s_app.ui.inspector_window)) {
-        menu_layer_reload_data(s_app.ui.inspector_menu_layer);
-      }
-
-      vibes_short_pulse();
-    } else {
-      vibes_double_pulse(); // Max exercises reached
-    }
-  }
-  window_stack_pop(true);
-}
-
-static void confirm_add_down_click(ClickRecognizerRef recognizer, void *context) {
-  // User clicked NO / CANCEL
-  window_stack_pop(true);
-}
-
-static void confirm_add_click_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_UP, confirm_add_up_click);
-  window_single_click_subscribe(BUTTON_ID_SELECT, confirm_add_up_click);
-  window_single_click_subscribe(BUTTON_ID_DOWN, confirm_add_down_click);
-  window_single_click_subscribe(BUTTON_ID_BACK, confirm_add_down_click);
-}
-
-static void confirm_add_window_load(Window *window) {
-  Layer *w_layer = window_get_root_layer(window);
-  GRect bounds = layer_get_bounds(w_layer);
-
-  s_app.ui.confirm_add_text_layer = build_text_layer(GRect(5, 5, bounds.size.w - 10, bounds.size.h - 5), FONT_KEY_GOTHIC_24_BOLD, GColorBlack, GTextAlignmentCenter, w_layer);
-
-  // Format the text nicely to show them what they dictated
-  static char conf_buf[128];
-  if (s_app.state.pending_exercise.target_weight == 0) {
-    snprintf(conf_buf, sizeof(conf_buf), "ADD EXERCISE?\n%s\n%d Sets x %d Reps\n(BW)\n\n[Select] Yes\n[Back] Cancel",
-             s_app.state.pending_exercise.name, s_app.state.pending_exercise.target_sets, s_app.state.pending_exercise.target_reps);
-  } else {
-    snprintf(conf_buf, sizeof(conf_buf), "ADD EXERCISE?\n%s\n%d Sets x %d Reps\n@ %d%s\n\n[Select] Yes\n[Back] Cancel",
-             s_app.state.pending_exercise.name, s_app.state.pending_exercise.target_sets, s_app.state.pending_exercise.target_reps,
-             s_app.state.pending_exercise.target_weight, s_app.settings.weight_unit_idx == 0 ? "kg" : "lbs");
-  }
-  text_layer_set_text(s_app.ui.confirm_add_text_layer, conf_buf);
-}
-
-static void confirm_add_window_unload(Window *window) {
-  text_layer_destroy(s_app.ui.confirm_add_text_layer);
-}
-
-static void push_confirm_add_window() {
-  if(!s_app.ui.confirm_add_window) {
-    s_app.ui.confirm_add_window = window_create();
-    window_set_click_config_provider(s_app.ui.confirm_add_window, confirm_add_click_provider);
-    window_set_window_handlers(s_app.ui.confirm_add_window, (WindowHandlers) { .load = confirm_add_window_load, .unload = confirm_add_window_unload });
-  }
-  window_set_background_color(s_app.ui.confirm_add_window, get_bg_color());
-  window_stack_push(s_app.ui.confirm_add_window, true);
 }
 
 // ----------- Sensation Window -----------
@@ -2155,61 +2124,54 @@ static void summary_window_load(Window *window) {
     offset += (written > 0 && written < limit - offset) ? written : limit - offset - 1;
   }
 
-  int s_written = snprintf(s_sync_out_buf, limit, "%s|%d|%d",
-    s_app.state.routine_name, s_app.settings.progression_mode, s_app.settings.weight_increment);
-  int s_off = (s_written > 0 && s_written < limit) ? s_written : limit - 1;
+  // v7.0.0: the routine definition NO LONGER travels watch -> phone. Only the
+  // exercises whose targets actually changed (dirty flag, set by the
+  // progression block earlier in this function) are reported as a 'P' delta,
+  // so the phone stays the single source of truth for routine definitions.
+  // Format: "<routine>|<prog>|<inc>|<name>|<reps'>|<weight'>|..."
+  static char delta_buf[512];
+  int d_off = snprintf(delta_buf, sizeof(delta_buf), "%s|%d|%d",
+                       s_app.state.routine_name,
+                       s_app.settings.progression_mode,
+                       s_app.settings.weight_increment);
 
   for (int i = 0; i < s_app.state.total_exercises; i++) {
-    // OPT #5: only write exercises whose progression actually changed
-    // if (s_app.settings.progression_mode != -1 && s_app.state.exercises[i].dirty)
-      persist_write_data(ROUTINE_EX_BASE + (s_app.state.current_slot * MAX_EXERCISES) + i,
-                         &s_app.state.exercises[i], sizeof(Exercise));
+    // Only exercises the progression block actually bumped.
+    if (!s_app.state.exercises[i].dirty) continue;
 
-    int base_sets = s_app.state.exercises[i].target_sets;
-    if (s_app.state.exercises[i].modifier == 1)
-      s_app.state.exercises[i].target_sets = base_sets / 2;
-
-    if (s_off < limit - 1) {
-      s_written = snprintf(s_sync_out_buf + s_off, limit - s_off, "|%s|%d|%d|%d|%d|%s",
-        s_app.state.exercises[i].name,
-        s_app.state.exercises[i].target_sets,
-        s_app.state.exercises[i].target_reps,
-        s_app.state.exercises[i].target_weight,
-        s_app.state.exercises[i].modifier,
-        s_app.state.exercises[i].comment[0] != '\0' ? s_app.state.exercises[i].comment : "-");
-      s_off += (s_written > 0 && s_written < limit - s_off) ? s_written : limit - s_off - 1;
+    if (d_off > 0 && d_off < (int)sizeof(delta_buf) - 1) {
+      int n = snprintf(delta_buf + d_off, sizeof(delta_buf) - d_off, "|%s|%d|%d",
+                       s_app.state.exercises[i].name,
+                       s_app.state.exercises[i].target_reps,
+                       s_app.state.exercises[i].target_weight);
+      if (n > 0 && n < (int)sizeof(delta_buf) - d_off) {
+        d_off += n;
+      } else {
+        d_off = (int)sizeof(delta_buf) - 1;   // full: stop appending
+        break;
+      }
     }
 
-    s_app.state.exercises[i].target_sets = base_sets;
+    // Persist the progressed target so the next session starts from it, then
+    // clear the flag so the same delta is never reported twice.
+    persist_write_data(ROUTINE_EX_BASE + (s_app.state.current_slot * MAX_EXERCISES) + i,
+                       &s_app.state.exercises[i], sizeof(Exercise));
+    s_app.state.exercises[i].dirty = false;
   }
 
-  // Split the two payloads into separate outbound messages so the workout
-  // summary (now carrying per-set HR + the time-series) gets its own buffer.
-  DictionaryIterator *iter;
-  if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
-    dict_write_cstring(iter, MESSAGE_KEY_WORKOUT_SUMMARY, export_buf);
-    app_message_outbox_send();
-    s_sync_sent_summary = false;  // ROUTINE_DATA is sent from outbox_sent_callback
-    text_layer_set_text(s_app.ui.sum_info_layer, celebration_buf);
-  } else {
-    text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nCheck Bluetooth.");
+  // Send the progression delta (if anything progressed) and stage the report.
+  if (d_off > 0) {
+    // Keep a copy: proto_send() copies the body immediately, so the shared
+    // delta_buf being static is safe, but being explicit avoids surprises.
+    proto_send("P", delta_buf);
   }
-}
 
-static void outbox_sent_callback(DictionaryIterator *iterator, void *context) {
-  // First message (WORKOUT_SUMMARY) is out — follow up with ROUTINE_DATA.
-  if (!s_sync_sent_summary) {
-    s_sync_sent_summary = true;
-    DictionaryIterator *iter2;
-    if (app_message_outbox_begin(&iter2) == APP_MSG_OK) {
-      dict_write_cstring(iter2, MESSAGE_KEY_ROUTINE_DATA, s_sync_out_buf);
-      app_message_outbox_send();
-    }
-  }
-}
+  report_stage_buf = export_buf;
 
-static void outbox_failed_callback(DictionaryIterator *iterator, AppMessageResult reason, void *context) {
-  text_layer_set_text(s_app.ui.sum_info_layer, "Sync Failed.\nCheck Bluetooth.");
+  // Stage the report before the first send so an unacknowledged workout is
+  // resent on reconnect/boot instead of being lost with Bluetooth.
+  report_stage_and_send();
+  text_layer_set_text(s_app.ui.sum_info_layer, celebration_buf);
 }
 
 static void summary_window_unload(Window *window) {
@@ -2634,7 +2596,6 @@ static void action_window_load(Window *window) {
   int num_items = 0;
   s_app.ui.action_menu_items[num_items++] = (SimpleMenuItem){ .title = "Start Workout",  .callback = action_start_callback };
   s_app.ui.action_menu_items[num_items++] = (SimpleMenuItem){ .title = "View Exercises", .callback = action_inspect_callback };
-  s_app.ui.action_menu_items[num_items++] = (SimpleMenuItem){ .title = "Add Ex. (Voice)", .callback = action_quick_add_callback };
   s_app.ui.action_menu_items[num_items++] = (SimpleMenuItem){ .title = "Move / Delete",  .callback = action_edit_callback };
   s_app.ui.action_menu_sections[0] = (SimpleMenuSection){
     .title = s_app.storage.slot_names[s_app.storage.slot_to_edit],
@@ -2647,14 +2608,6 @@ static void action_window_load(Window *window) {
   menu_layer_set_normal_colors(internal,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(internal, get_theme_color(), get_bg_color());
   layer_add_child(w_layer, simple_menu_layer_get_layer(s_app.ui.action_menu_layer));
-}
-static void action_quick_add_callback(int index, void *ctx) {
-  window_stack_remove(s_app.ui.action_window, false);
-  s_app.state.adding_exercise_to_slot = s_app.storage.slot_to_edit;
-  if (!s_app.state.new_ex_dictation_session) {
-    s_app.state.new_ex_dictation_session = dictation_session_create(128, new_exercise_dictation_callback, NULL);
-  }
-  dictation_session_start(s_app.state.new_ex_dictation_session);
 }
 static void action_window_unload(Window *window) { simple_menu_layer_destroy(s_app.ui.action_menu_layer); }
 static void push_action_window(void) {
@@ -2700,7 +2653,6 @@ static void mega_window_load(Window *window) {
   s_app.ui.mega_menu_items[n++] = (SimpleMenuItem){ .title = "Jump to Exercise",        .subtitle = "Go to any exercise in routine",  .callback = menu_jump_callback };
   s_app.ui.mega_menu_items[n++] = (SimpleMenuItem){ .title = "Skip Set (Log 0)",        .subtitle = "Progress to next set",           .callback = menu_skip_set_callback };
   s_app.ui.mega_menu_items[n++] = (SimpleMenuItem){ .title = "Skip Exercise (Log 0)",   .subtitle = "Progress to next exercise",      .callback = menu_skip_callback };
-  s_app.ui.mega_menu_items[n++] = (SimpleMenuItem){ .title = "Add Ex. (Voice)", .subtitle = "Append to routine", .callback = menu_quick_add_callback };
 
   s_app.ui.mega_menu_sections[0] = (SimpleMenuSection){ .num_items = n, .items = s_app.ui.mega_menu_items };
 
@@ -2711,14 +2663,6 @@ static void mega_window_load(Window *window) {
   menu_layer_set_normal_colors(internal,    get_bg_color(), get_text_color());
   menu_layer_set_highlight_colors(internal, get_theme_color(), get_bg_color());
   layer_add_child(w_layer, simple_menu_layer_get_layer(s_app.ui.mega_menu_layer));
-}
-static void menu_quick_add_callback(int index, void *ctx) {
-  window_stack_remove(s_app.ui.mega_window, false);
-  s_app.state.adding_exercise_to_slot = s_app.state.current_slot;
-  if (!s_app.state.new_ex_dictation_session) {
-    s_app.state.new_ex_dictation_session = dictation_session_create(128, new_exercise_dictation_callback, NULL);
-  }
-  dictation_session_start(s_app.state.new_ex_dictation_session);
 }
 static void mega_window_unload(Window *window) { simple_menu_layer_destroy(s_app.ui.mega_menu_layer); }
 static void push_mega_window(void) {
@@ -3994,11 +3938,569 @@ static void push_timer_edit_window(void) {
 }
 
 // ========================================================================= //
+//                     9b. WIRE PROTOCOL (v7.0.0)                            //
+// ------------------------------------------------------------------------- //
+// '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'                                  //
+//                                                                           //
+// Outbound: split into PROTO_CHUNK_PAYLOAD-sized chunks, each sent as its   //
+// own PROTO_MESSAGE. The receiver reassembles and replies PROTO_ACK; a      //
+// failure replies a NAK id, and the sender retries up to PROTO_MAX_RETRIES. //
+// Inbound: chunk reassembly happens here, then the completed body is        //
+// dispatched to the same handlers the legacy keys use.                      //
+//                                                                           //
+// Session-only data (added sets, swaps, variations, actuals) stays on the   //
+// watch. Routine DEFINITIONS never travel watch -> phone in v7: the only    //
+// routine-shaped message the watch emits is a 'P' progression delta.        //
+// ========================================================================= //
+
+// Outbound state
+static char s_proto_out_buf[EXPORT_BUF_SIZE];   // body being sent (R/B/W/P)
+static char s_proto_out_id[8] = "0";
+static uint16_t s_proto_out_seq = 0;
+static uint16_t s_proto_out_total = 0;
+static int  s_proto_retries = 0;
+static char s_proto_out_type = 0;
+static uint16_t s_proto_next_id = 1;
+
+// 1 while the current outbound transfer is a workout report (so an ACK clears
+// the staged copy instead of leaving it to be resent forever).
+static bool s_proto_out_is_report = false;
+
+// Inbound reassembly state
+static char s_proto_in_buf[PROTO_IN_BUF_SIZE];
+static int  s_proto_in_len = 0;
+static uint16_t s_proto_in_expected = 0;
+static uint16_t s_proto_in_got = 0;
+static char s_proto_in_id[8] = "0";
+static char s_proto_in_type = 0;
+
+// Pointer to the live export buffer that staging copies from.
+// (Declared near the top so summary_window_load can assign it.)
+
+// ---- versioning -------------------------------------------------------- //
+static void proto_note_version(int ver) {
+  int known = persist_exists(PROTO_VERSION_KEY) ? persist_read_int(PROTO_VERSION_KEY) : 0;
+  if (ver > known) persist_write_int(PROTO_VERSION_KEY, ver);
+}
+
+// A peer speaking a newer protocol than us is refused loudly instead of being
+// fed a payload we would mis-parse.
+static bool proto_version_ok(int ver) {
+  return ver >= 1 && ver <= PROTO_VERSION;
+}
+
+static void proto_fail_visible(const char *msg) {
+  if (s_app.ui.sum_info_layer) text_layer_set_text(s_app.ui.sum_info_layer, msg);
+}
+
+// ---- outbound ---------------------------------------------------------- //
+
+// Send chunk `s_proto_out_seq` of the current transfer. Every chunk is a
+// complete, self-contained message, so losing one only costs that chunk.
+static void proto_send_chunk(void) {
+  if (s_proto_out_seq >= s_proto_out_total) return;
+
+  // 'VER|T|id|seq/total|' header is at most ~24 chars; 64 is generous headroom
+  // for the body so the snprintf below can never truncate mid-envelope.
+  static char msg[PROTO_CHUNK_PAYLOAD + 64];
+  int body_len  = (int)strlen(s_proto_out_buf);
+  int body_off  = (int)s_proto_out_seq * PROTO_CHUNK_PAYLOAD;
+  if (body_off < 0 || body_off > body_len) { s_proto_out_total = 0; return; }
+  int remaining = body_len - body_off;
+  int take = (remaining > PROTO_CHUNK_PAYLOAD) ? PROTO_CHUNK_PAYLOAD : remaining;
+
+  snprintf(msg, sizeof(msg), "%d|%c|%s|%u/%u|%.*s",
+           PROTO_VERSION, s_proto_out_type, s_proto_out_id,
+           (unsigned)(s_proto_out_seq + 1), (unsigned)s_proto_out_total,
+           take, s_proto_out_buf + body_off);
+
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) {
+    proto_fail_visible("Sync Failed.\nCheck Bluetooth.");
+    return;
+  }
+  dict_write_cstring(iter, MESSAGE_KEY_PROTO_MESSAGE, msg);
+  app_message_outbox_send();
+}
+
+// Start a new outbound transfer of `body` with the given type.
+static void proto_send(const char *type, const char *body) {
+  if (!body) body = "";
+
+  size_t body_len = strlen(body);
+  if (body_len > sizeof(s_proto_out_buf) - 1) body_len = sizeof(s_proto_out_buf) - 1;
+
+  // Copy into our own buffer: callers often pass a window into state that can
+  // change while the transfer is in flight.
+  memcpy(s_proto_out_buf, body, body_len);
+  s_proto_out_buf[body_len] = '\0';
+
+  int chunks = (int)((body_len + PROTO_CHUNK_PAYLOAD - 1) / PROTO_CHUNK_PAYLOAD);
+  if (chunks <= 0) chunks = 1;
+  if (chunks > PROTO_MAX_CHUNKS) chunks = PROTO_MAX_CHUNKS;   // bounded by EXPORT_BUF_SIZE
+
+  s_proto_out_type  = type[0];
+  s_proto_out_total = (uint16_t)chunks;
+  s_proto_out_seq   = 0;
+  s_proto_retries   = 0;
+  snprintf(s_proto_out_id, sizeof(s_proto_out_id), "%u", (unsigned)s_proto_next_id++);
+  if (s_proto_next_id == 0) s_proto_next_id = 1;
+
+  proto_send_chunk();
+}
+
+static void proto_send_ack(const char *id) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_cstring(iter, MESSAGE_KEY_PROTO_ACK, id ? id : "0");
+  app_message_outbox_send();
+}
+
+// ---- report staging ---------------------------------------------------- //
+
+// Persist the report so it survives a reboot or a phone that is out of range,
+// then start the transfer. Fixed 256-byte records keep each persist entry
+// small enough for the storage API.
+static void report_stage_and_send(void) {
+  if (!report_stage_buf) return;
+
+  int len = (int)strlen(report_stage_buf);
+  int max = REPORT_STAGED_CHUNKS * 256;
+  if (len > max) len = max;         // the HR tail is appended last, so it is what gets cut
+
+  persist_write_int(REPORT_STAGED_LEN_KEY, len);
+  for (int c = 0; c < REPORT_STAGED_CHUNKS; c++) {
+    int off = c * 256;
+    int take = len - off;
+    if (take <= 0) { persist_delete(REPORT_STAGED_BUF_KEY + c); continue; }
+    if (take > 256) take = 256;
+    persist_write_data(REPORT_STAGED_BUF_KEY + c, report_stage_buf + off, take);
+  }
+
+  s_proto_out_is_report = true;
+  proto_send("W", report_stage_buf);
+}
+
+static void report_clear_staged(void) {
+  persist_delete(REPORT_STAGED_LEN_KEY);
+  for (int c = 0; c < REPORT_STAGED_CHUNKS; c++) persist_delete(REPORT_STAGED_BUF_KEY + c);
+  s_proto_out_is_report = false;
+}
+
+// Resend a staged (unacknowledged) report. Called on Bluetooth reconnect, on
+// boot with the phone nearby, and from the "Resend Last Workout" menu item.
+static void report_retry_staged(void) {
+  if (!persist_exists(REPORT_STAGED_LEN_KEY)) return;
+
+  int len = persist_read_int(REPORT_STAGED_LEN_KEY);
+  int max = (int)sizeof(s_proto_out_buf) - 1;
+  if (len <= 0 || len > max) { report_clear_staged(); return; }
+
+  static char staged[REPORT_STAGED_CHUNKS * 256 + 1];
+  int off = 0;
+  for (int c = 0; c < REPORT_STAGED_CHUNKS && off < len; c++) {
+    int got = persist_read_data(REPORT_STAGED_BUF_KEY + c, staged + off, 256);
+    if (got <= 0) break;
+    off += got;
+  }
+  if (off <= 0) { report_clear_staged(); return; }
+  staged[off] = '\0';
+
+  s_proto_out_is_report = true;
+  proto_send("W", staged);
+}
+
+// Phone app connection came back: if a report is still staged (never ACKed),
+// push it now. Runs on the app's event loop, so the outbox is free.
+static void on_pebblekit_connection(bool connected) {
+  if (!connected) return;
+  if (persist_exists(REPORT_STAGED_LEN_KEY)) report_retry_staged();
+}
+
+// ---- outbox callbacks -------------------------------------------------- //
+
+// Chunk N went out; queue chunk N+1. The chain ends when the last chunk has
+// been handed to the phone app, at which point we wait for the ACK.
+static void outbox_sent_callback(DictionaryIterator *iterator, void *context) {
+  if (s_proto_out_total == 0) return;
+
+  s_proto_out_seq++;
+  if (s_proto_out_seq < s_proto_out_total) {
+    proto_send_chunk();
+  } else {
+    // Whole sequence handed off. Reset the cursor so an ACK can still match by
+    // id without re-sending; the phone is the one that confirms delivery.
+    s_proto_out_seq = s_proto_out_total;
+  }
+}
+
+// A chunk failed to leave the watch (no phone / out of range). Retry the
+// current chunk a bounded number of times, then tell the user. The staged
+// report stays on disk, so it is resent on reconnect regardless.
+static void outbox_failed_callback(DictionaryIterator *iterator, AppMessageResult reason, void *context) {
+  if (s_proto_out_total > 0 && s_proto_out_seq < s_proto_out_total) {
+    if (s_proto_retries < PROTO_MAX_RETRIES) {
+      s_proto_retries++;
+      proto_send_chunk();
+      return;
+    }
+  }
+  s_proto_retries = 0;
+  proto_fail_visible("Sync failed.\nWill retry.");
+}
+
+
+
+// ========================================================================= //
 //                        10. APP MESSAGE (INBOX)                            //
 // ========================================================================= //
+// ------------------------------------------------------------------------- //
+// Apply ONE routine string to a slot. Returns true when the string parsed to  //
+// a named routine with at least one exercise (the same validity rule the      //
+// batch path uses). `merge_history` copies old actuals for exercises that     //
+// already existed in that slot.                                               //
+// ------------------------------------------------------------------------- //
+static bool apply_routine_to_slot(const char *routine_str, int slot_idx, bool merge_history) {
+  if (!routine_str || slot_idx < 0 || slot_idx >= MAX_SLOTS) return false;
+
+  parse_routine_string(routine_str);
+  if (s_app.state.routine_name[0] == '\0') return false;
+  if (s_app.state.total_exercises <= 0) return false;
+
+  if (merge_history) {
+    for (int i = 0; i < s_app.state.total_exercises; i++) {
+      for (int old_idx = 0; old_idx < s_app.storage.slot_counts[slot_idx]; old_idx++) {
+        Exercise old_ex;
+        if (persist_read_data(ROUTINE_EX_BASE + (slot_idx * MAX_EXERCISES) + old_idx,
+                              &old_ex, sizeof(Exercise)) > 0) {
+          if (strcmp(s_app.state.exercises[i].name, old_ex.name) == 0) {
+            for (int s = 0; s < 10; s++) {
+              s_app.state.exercises[i].actual_reps[s]   = old_ex.actual_reps[s];
+              s_app.state.exercises[i].actual_weight[s] = old_ex.actual_weight[s];
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  save_routine_to_slot(slot_idx);
+  return true;
+}
+
+// Find the slot a routine name currently occupies, or -1.
+static int find_slot_by_name(const char *name) {
+  if (!name || name[0] == '\0') return -1;
+  for (int i = 0; i < s_app.storage.active_slots; i++)
+    if (strcmp(s_app.storage.slot_names[i], name) == 0) return i;
+  return -1;
+}
+
+// ------------------------------------------------------------------------- //
+// 'R' — single routine, phone -> watch. Existing routines are updated in      //
+// place (history preserved); new ones take the next free slot.               //
+// ------------------------------------------------------------------------- //
+static void handle_routine_single(char *payload) {
+  int target_slot = find_slot_by_name(s_app.state.routine_name);
+
+  if (target_slot < 0) {
+    target_slot = s_app.storage.active_slots;
+    if (target_slot > MAX_SLOTS - 1) target_slot = MAX_SLOTS - 1;
+    if (!apply_routine_to_slot(payload, target_slot, false)) {
+      proto_fail_visible("Routine rejected.\nBad payload.");
+      return;
+    }
+  } else if (!apply_routine_to_slot(payload, target_slot, true)) {
+    proto_fail_visible("Routine rejected.\nBad payload.");
+    return;
+  }
+
+  refresh_directory();
+  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+}
+
+// ------------------------------------------------------------------------- //
+// Batch, phone -> watch, sent as 'M' (open) -> 'R' per routine -> 'Z' (commit).
+//
+// Nothing in the live library is touched until 'Z' arrives, which gives us
+// validate-then-commit. Staged members live in PERSIST storage rather than RAM:
+// a 7-routine batch is ~9 KB and flint (Pebble 2 Duo, 64 KB RAM) cannot spare
+// that as static .bss — an in-RAM staging area overflowed the APP region by
+// 3 KB. Each staged routine is stored as a small header plus chunks, so the
+// whole batch costs zero RAM and survives a reboot mid-transfer.
+// ------------------------------------------------------------------------- //
+#define BATCH_STAGE_MAX   MAX_SLOTS
+#define BATCH_STAGE_CHUNK 256                       // persist record size
+#define BATCH_STAGE_SLOTS 6                         // 1536 / 256
+#define BATCH_STAGE_STRIDE (BATCH_STAGE_CHUNK * BATCH_STAGE_SLOTS)
+// Must not overlap ROUTINE_EX_BASE (1000 + MAX_SLOTS*MAX_EXERCISES = 1105),
+// the *_MIGRATION_KEY / report-staging block at 940-947, or ACTIVE_EX_BASE (400).
+#define BATCH_STAGE_KEY_BASE 1200
+#define BATCH_STAGE_COUNT_KEY 1210
+#define BATCH_STAGE_OPEN_KEY  1211
+
+static int  s_batch_stage_count = 0;
+static bool s_batch_open = false;
+
+static void batch_clear_storage(void) {
+  for (int i = 0; i < BATCH_STAGE_MAX; i++)
+    for (int c = 0; c < BATCH_STAGE_SLOTS; c++)
+      persist_delete(BATCH_STAGE_KEY_BASE + (i * BATCH_STAGE_STRIDE) + c);
+  persist_delete(BATCH_STAGE_COUNT_KEY);
+  persist_delete(BATCH_STAGE_OPEN_KEY);
+}
+
+static void batch_begin(void) {
+  batch_clear_storage();
+  s_batch_open = true;
+  s_batch_stage_count = 0;
+}
+
+static void batch_abort(void) {
+  s_batch_open = false;
+  s_batch_stage_count = 0;
+  batch_clear_storage();
+  proto_fail_visible("Batch rejected.\nNothing changed.");
+  vibes_double_pulse();
+}
+
+// Stage one member into persist. Returns false if it is invalid or does not fit.
+static bool batch_add_member(const char *routine_str) {
+  if (s_batch_stage_count >= BATCH_STAGE_MAX) return false;
+
+  // Validate without persisting: a parse leaves the name empty on failure.
+  parse_routine_string(routine_str);
+  if (s_app.state.routine_name[0] == '\0' || s_app.state.total_exercises <= 0) {
+    s_app.state.routine_name[0] = '\0';
+    s_app.state.total_exercises = 0;
+    return false;
+  }
+
+  int len = (int)strlen(routine_str);
+  int max = BATCH_STAGE_STRIDE - 1;
+  if (len <= 0 || len > max) return false;   // refuse rather than truncate
+
+  int slot = s_batch_stage_count;
+  int off  = 0;
+  for (int c = 0; c < BATCH_STAGE_SLOTS; c++) {
+    int take = len - off;
+    if (take <= 0) break;
+    if (take > BATCH_STAGE_CHUNK) take = BATCH_STAGE_CHUNK;
+    persist_write_data(BATCH_STAGE_KEY_BASE + (slot * BATCH_STAGE_STRIDE) + c,
+                       routine_str + off, take);
+    off += take;
+  }
+
+  s_batch_stage_count++;
+  persist_write_int(BATCH_STAGE_COUNT_KEY, s_batch_stage_count);
+  return true;
+}
+
+// 'Z': every member validated, so commit. Only now is the old library cleared.
+static void batch_commit(void) {
+  if (!s_batch_open || s_batch_stage_count == 0) { batch_abort(); return; }
+
+  // Re-read each staged routine into the shared scratch buffer, one at a time.
+  static char member[EXPORT_BUF_SIZE];
+
+  for (int i = 0; i < MAX_SLOTS; i++) {
+    persist_delete(STORAGE_KEY_BASE + i);
+    for (int j = 0; j < MAX_EXERCISES; j++)
+      persist_delete(ROUTINE_EX_BASE + (i * MAX_EXERCISES) + j);
+    persist_delete(LAST_COMPLETED_KEY_BASE + i);
+  }
+  s_app.storage.active_slots = 0;
+
+  for (int i = 0; i < s_batch_stage_count && i < MAX_SLOTS; i++) {
+    int off = 0;
+    for (int c = 0; c < BATCH_STAGE_SLOTS && off < (int)sizeof(member) - 1; c++) {
+      int got = persist_read_data(BATCH_STAGE_KEY_BASE + (i * BATCH_STAGE_STRIDE) + c,
+                                  member + off, BATCH_STAGE_CHUNK);
+      if (got <= 0) break;
+      off += got;
+    }
+    member[off] = '\0';
+    apply_routine_to_slot(member, i, false);
+  }
+
+  s_batch_open = false;
+  s_batch_stage_count = 0;
+  batch_clear_storage();
+
+  vibes_double_pulse();
+  refresh_directory();
+  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+}
+
+// ------------------------------------------------------------------------- //
+// 'S' — tombstone list, phone -> watch. The phone (source of truth) removed    //
+// these routines, so the watch drops them too. This is the ONLY deletion      //
+// that crosses the wire: a delete made ON the watch stays on the watch.       //
+// ------------------------------------------------------------------------- //
+static void handle_routine_tombstones(char *payload) {
+  char *cursor = payload;
+  char name[32];
+
+  while (*cursor != '\0') {
+    char *sep = strchr(cursor, '|');
+    int len = sep ? (int)(sep - cursor) : (int)strlen(cursor);
+    if (len > (int)sizeof(name) - 1) len = (int)sizeof(name) - 1;
+
+    memcpy(name, cursor, len);
+    name[len] = '\0';
+
+    int slot = find_slot_by_name(name);
+    if (slot >= 0) {
+      persist_delete(STORAGE_KEY_BASE + slot);
+      persist_delete(GHOST_KEY_BASE + slot);
+      persist_delete(LAST_COMPLETED_KEY_BASE + slot);
+      for (int j = 0; j < MAX_EXERCISES; j++)
+        persist_delete(ROUTINE_EX_BASE + (slot * MAX_EXERCISES) + j);
+      refresh_directory();
+    }
+
+    if (!sep) break;
+    cursor = sep + 1;
+  }
+
+  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+}
+
+// ------------------------------------------------------------------------- //
+// Routing: hand a fully reassembled body to the handler for its type.         //
+// ------------------------------------------------------------------------- //
+static void proto_dispatch(char type, char *body) {
+  switch (type) {
+    case 'R':
+      if (s_batch_open) {
+        // Member of an in-flight batch: validate now, commit on 'Z'.
+        if (!batch_add_member(body)) batch_abort();
+      } else {
+        handle_routine_single(body);
+      }
+      break;
+    case 'M': batch_begin();                    break;  // batch open
+    case 'Z': batch_commit();                   break;  // batch commit
+    case 'B': break;                            // legacy full-batch body, unused in v7
+    case 'S': handle_routine_tombstones(body);  break;
+    case 'W': report_clear_staged();            break;  // phone confirmed
+    case 'P': break;                            // watch -> phone only
+    default:  break;
+  }
+}
+
+// ------------------------------------------------------------------------- //
+// Inbound envelope: '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'                  //
+// Chunks are appended to s_proto_in_buf until seq == total, then dispatched.  //
+// ------------------------------------------------------------------------- //
+static bool proto_handle_envelope(const char *msg) {
+  // Parse the four fixed fields, then take the rest verbatim as the body.
+  const char *p = msg;
+
+  char *end = NULL;
+  long ver = strtol(p, &end, 10);
+  if (!end || *end != '|') return false;
+  p = end + 1;
+
+  char type = *p;
+  if (type == '\0' || *(p + 1) != '|') return false;
+  p += 2;
+
+  end = NULL;
+  long id = strtol(p, &end, 10);
+  if (!end || *end != '|') return false;
+  snprintf(s_proto_in_id, sizeof(s_proto_in_id), "%ld", id);
+  p = end + 1;
+
+  end = NULL;
+  long seq = strtol(p, &end, 10);
+  if (!end || *end != '/') return false;
+  p = end + 1;
+
+  end = NULL;
+  long total = strtol(p, &end, 10);
+  if (!end || *end != '|') return false;
+  const char *body = end + 1;
+
+  if (!proto_version_ok((int)ver)) {
+    // Newer peer: say so instead of mis-parsing, and do not ACK.
+    proto_fail_visible("Update the app.\nProtocol too new.");
+    return false;
+  }
+  proto_note_version((int)ver);
+
+  if (total < 1 || total > PROTO_MAX_CHUNKS) return false;
+  if (seq < 1 || seq > total) return false;
+
+  // New transfer? Reset the reassembly buffer.
+  if (seq == 1) {
+    s_proto_in_len      = 0;
+    s_proto_in_expected = (uint16_t)total;
+    s_proto_in_got      = 0;
+    s_proto_in_type     = type;
+    s_proto_in_buf[0]   = '\0';
+  } else if (s_proto_in_expected != (uint16_t)total ||
+             s_proto_in_type != type ||
+             s_proto_in_got != (uint16_t)(seq - 1)) {
+    // Out of sequence, or a retried duplicate of a chunk we already have.
+    // Rejecting keeps a retransmit from corrupting the reassembled body.
+    return false;
+  }
+
+  size_t chunk_len = strlen(body);
+  if (s_proto_in_len + (int)chunk_len >= (int)sizeof(s_proto_in_buf)) {
+    return false;   // refuse rather than truncate
+  }
+
+  memcpy(s_proto_in_buf + s_proto_in_len, body, chunk_len);
+  s_proto_in_len += (int)chunk_len;
+  s_proto_in_buf[s_proto_in_len] = '\0';
+  s_proto_in_got++;
+
+  // The sender pushes the whole sequence, so we only act once every chunk of
+  // this transfer has arrived and the body is complete.
+  if (s_proto_in_got >= s_proto_in_expected) {
+    char completed_type = s_proto_in_type;
+    s_proto_in_expected = 0;
+    s_proto_in_got      = 0;
+    proto_dispatch(completed_type, s_proto_in_buf);
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------------- //
+// Inbox entry point. Handles the v7 envelope first; falls back to the legacy  //
+// keys for one release so a v6 phone app still works against a v7 watch.      //
+// ------------------------------------------------------------------------- //
 static void inbox_received_callback(DictionaryIterator *iterator, void *context) {
 
-  // ----------- Handle full routines sent from phone -----------
+  // ---------- v7 envelope ----------
+  Tuple *proto_tuple = dict_find(iterator, MESSAGE_KEY_PROTO_MESSAGE);
+  if (proto_tuple && proto_tuple->type == TUPLE_CSTRING) {
+    // Only ACK a chunk we actually accepted. An unparseable or out-of-sequence
+    // chunk is left unacknowledged so the phone retries it instead of assuming
+    // delivery and leaving a half-transferred routine behind.
+    if (proto_handle_envelope(proto_tuple->value->cstring)) {
+      proto_send_ack(s_proto_in_id);
+    }
+    return;
+  }
+
+  // ---------- ACK for something we sent ----------
+  Tuple *ack_tuple = dict_find(iterator, MESSAGE_KEY_PROTO_ACK);
+  if (ack_tuple && ack_tuple->type == TUPLE_CSTRING) {
+    // The phone has the whole report: drop the staged copy so it is not
+    // resent on the next reconnect.
+    if (s_proto_out_is_report && strcmp(ack_tuple->value->cstring, s_proto_out_id) == 0) {
+      report_clear_staged();
+      s_proto_out_seq = 0;
+      s_proto_out_total = 0;
+    }
+    return;
+  }
+
+  // ---------- Legacy keys (v6 phone app) ----------
   Tuple *routine_data_tuple = dict_find(iterator, MESSAGE_KEY_ROUTINE_DATA);
   if (routine_data_tuple && routine_data_tuple->type == TUPLE_CSTRING) {
     static char inbox_copy[EXPORT_BUF_SIZE];
@@ -4006,78 +4508,37 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     inbox_copy[sizeof(inbox_copy) - 1] = '\0';
 
     if (strncmp(inbox_copy, "BATCH~", 6) == 0) {
-      for (int i = 0; i < MAX_SLOTS; i++) {
-        persist_delete(STORAGE_KEY_BASE + i);
-        for (int j = 0; j < MAX_EXERCISES; j++)
-          persist_delete(ROUTINE_EX_BASE + (i * MAX_EXERCISES) + j);
-        persist_delete(LAST_COMPLETED_KEY_BASE + i);
+      // Legacy v6 batch: one message, `~`-separated. Staged member by member
+      // through the same validate-then-commit path as the v7 'M'/'R'/'Z' flow,
+      // so it can no longer wipe the library on a bad payload.
+      batch_begin();
+      char *cursor = inbox_copy + 6;
+      while (cursor && *cursor != '\0') {
+        char *sep = strchr(cursor, '~');
+        if (sep) *sep = '\0';
+        if (!batch_add_member(cursor)) { batch_abort(); break; }
+        if (!sep) break;
+        cursor = sep + 1;
       }
-      s_app.storage.active_slots = 0;
-
-      char *start   = inbox_copy + 6;
-      char *end     = start;
-      int slot_idx  = 0;
-
-      while (*end != '\0' && slot_idx < MAX_SLOTS) {
-        if (*end == '~') {
-          *end = '\0';                // safe: modifying our own local copy
-          parse_routine_string(start);
-          save_routine_to_slot(slot_idx++);
-          start = end + 1;
-        }
-        end++;
-      }
-      if (*start != '\0' && slot_idx < MAX_SLOTS) {
-        parse_routine_string(start);
-        save_routine_to_slot(slot_idx);
-      }
-      vibes_double_pulse();
-
+      if (s_batch_open) batch_commit();
     } else {
+      // The legacy path cannot address a slot by name, so resolve it the way
+      // the old code did: parse first, then look the name up.
       parse_routine_string(inbox_copy);
-      
-      int target_slot = s_app.storage.active_slots;
-      bool slot_exists = false;
-      
-      // Find out if we are updating an existing routine or creating a new one
-      for (int i = 0; i < s_app.storage.active_slots; i++) {
-        if (strcmp(s_app.storage.slot_names[i], s_app.state.routine_name) == 0) {
-          target_slot = i; 
-          slot_exists = true;
-          break;
-        }
+      int target = find_slot_by_name(s_app.state.routine_name);
+      if (target < 0) {
+        target = s_app.storage.active_slots;
+        if (target > MAX_SLOTS - 1) target = MAX_SLOTS - 1;
+        apply_routine_to_slot(inbox_copy, target, false);
+      } else {
+        apply_routine_to_slot(inbox_copy, target, true);
       }
-      if (target_slot > MAX_SLOTS - 1) target_slot = MAX_SLOTS - 1;
-
-      // PRESERVE HISTORY: If updating an existing routine, merge the old actuals!
-      if (slot_exists) {
-        for (int i = 0; i < s_app.state.total_exercises; i++) {
-          // Look for this specific exercise name in the old saved slot
-          for (int old_idx = 0; old_idx < s_app.storage.slot_counts[target_slot]; old_idx++) {
-            Exercise old_ex;
-            if (persist_read_data(ROUTINE_EX_BASE + (target_slot * MAX_EXERCISES) + old_idx, &old_ex, sizeof(Exercise)) > 0) {
-              if (strcmp(s_app.state.exercises[i].name, old_ex.name) == 0) {
-                // Match found! Copy the historical actuals into the incoming updated routine
-                for (int s = 0; s < 10; s++) {
-                  s_app.state.exercises[i].actual_reps[s] = old_ex.actual_reps[s];
-                  s_app.state.exercises[i].actual_weight[s] = old_ex.actual_weight[s];
-                }
-                break; // Found the match, move on to the next incoming exercise
-              }
-            }
-          }
-        }
-      }
-
-      // Now save the routine (which contains the new targets but preserves the old history)
-      save_routine_to_slot(target_slot);
+      refresh_directory();
+      if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
     }
-
-    refresh_directory();
-    menu_layer_reload_data(s_app.ui.menu_layer);
   }
 
-  // ----------- Handle progression settings updates -----------
+  // ---------- Progression settings ----------
   Tuple *prog_mode_tuple = dict_find(iterator, MESSAGE_KEY_PROGRESSION_MODE);
   if (prog_mode_tuple) {
     s_app.settings.progression_mode = prog_mode_tuple->value->int32;
@@ -4088,49 +4549,6 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
   if (weight_inc_tuple) {
     s_app.settings.weight_increment = weight_inc_tuple->value->int32;
     persist_write_int(SETTINGS_KEY_BASE + SK_WEIGHT_INC, s_app.settings.weight_increment);
-  }
-
-  // ----------- Catch single parsed voice exercise from phone -----------
-  Tuple *new_ex_tuple = dict_find(iterator, MESSAGE_KEY_NEW_EXERCISE_DATA);
-  if (new_ex_tuple) {
-    char *new_ex_str = new_ex_tuple->value->cstring;
-
-    Exercise ex;
-    memset(&ex, 0, sizeof(Exercise));
-
-    char temp[32];
-    int field = 0, t_idx = 0;
-
-    // Unpack the phone's parsed string (e.g. "Bicep Curls|3|10|15|0|-")
-    for (int i = 0; new_ex_str[i] != '\0'; i++) {
-      if (new_ex_str[i] == '|') {
-        temp[t_idx] = '\0';
-        if (field == 0) snprintf(ex.name, sizeof(ex.name), "%s", temp);
-        else if (field == 1) ex.target_sets = atoi(temp);
-        else if (field == 2) ex.target_reps = atoi(temp);
-        else if (field == 3) ex.target_weight = atoi(temp);
-        else if (field == 4) ex.modifier = atoi(temp);
-        field++;
-        t_idx = 0;
-      } else {
-        if (t_idx < 31) temp[t_idx++] = new_ex_str[i];
-      }
-    }
-    temp[t_idx] = '\0';
-    if (field == 5) {
-      if (strcmp(temp, "-") == 0) ex.comment[0] = '\0';
-      else snprintf(ex.comment, sizeof(ex.comment), "%s", temp);
-    }
-
-    // Initialize runtime variables
-    if (ex.target_sets > 10) ex.target_sets = 10;  // actual_* arrays hold 10 sets
-    if (ex.target_sets < 1)  ex.target_sets = 1;
-    ex.current_set = 1;
-    for(int j=0; j<10; j++) { ex.actual_reps[j] = 0; ex.actual_weight[j] = 0; }
-
-    // Hold it in memory and ask the user!
-    s_app.state.pending_exercise = ex;
-    push_confirm_add_window();
   }
 }
 
@@ -4162,9 +4580,22 @@ static void init(void) {
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_outbox_sent(outbox_sent_callback);
   app_message_register_outbox_failed(outbox_failed_callback);
-  // 2048 inbox for our 1300-byte routines; 2048 outbox for the workout summary
-  // (which now carries per-set HR + the HR time-series).
+  // 2048 inbox: chunked routine payloads arrive one chunk per message, and the
+  // reassembly buffer (s_proto_in_buf) is a separate static. 2048 outbox: the
+  // workout report carries per-set HR + the HR time-series, one chunk at a time.
   app_message_open(2048, 2048);
+
+  // v7.0.0: if a report was staged but never acknowledged (phone out of range
+  // when the workout finished), send it as soon as the phone is reachable
+  // again. This is what makes "leave the phone in the locker" safe.
+  connection_service_subscribe((ConnectionHandlers){
+    .pebble_app_connection_handler = NULL,
+    .pebblekit_connection_handler  = on_pebblekit_connection,
+  });
+
+  if (persist_exists(REPORT_STAGED_LEN_KEY)) {
+    report_retry_staged();
+  }
 }
 
 static void deinit(void) {
@@ -4200,14 +4631,9 @@ static void deinit(void) {
   if (s_app.ui.action_window)    { window_destroy(s_app.ui.action_window);    s_app.ui.action_window    = NULL; }
   if (s_app.ui.inspector_window) { window_destroy(s_app.ui.inspector_window); s_app.ui.inspector_window = NULL; }
   if (s_app.ui.ex_action_window) { window_destroy(s_app.ui.ex_action_window); s_app.ui.ex_action_window = NULL; }
-  if (s_app.ui.confirm_add_window) { window_destroy(s_app.ui.confirm_add_window); s_app.ui.confirm_add_window = NULL; }
   if (s_app.state.dictation_session) {
     dictation_session_destroy(s_app.state.dictation_session);
     s_app.state.dictation_session = NULL;
-  }
-  if (s_app.state.new_ex_dictation_session) {
-    dictation_session_destroy(s_app.state.new_ex_dictation_session);
-    s_app.state.new_ex_dictation_session = NULL;
   }
 
   window_destroy(s_app.ui.main_window);

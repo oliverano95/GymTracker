@@ -88,7 +88,7 @@ function saveWorkoutLocally(rawData) {
 }
 
 // ============================================================
-// ROUTINE PARSER (Two-Way Sync)
+// ROUTINE PARSER (watch -> phone, legacy strings only)
 // Extracted from the appmessage handler so it is testable and
 // readable independently.
 // ============================================================
@@ -151,6 +151,185 @@ function autoSyncRoutine(syncString, routineName, parsedRoutine) {
 }
 
 // ============================================================
+// WIRE PROTOCOL (v7.0.0)
+// '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'
+//
+// The watch sends chunks as separate PROTO_MESSAGE keys; we reassemble,
+// ACK, then dispatch. Outbound chunks are queued because Pebble.sendAppMessage
+// has a single in-flight outbox: each success callback sends the next chunk.
+// ============================================================
+var PROTO = {
+  VERSION: 1,
+  CHUNK: 512,
+  // Must match PROTO_MAX_CHUNKS in main.c: 4 x 512 = the watch's 2048-byte
+  // reassembly buffer. Batches do not need a bigger buffer because they are
+  // split into one transfer per routine ('M' / 'R' / 'R' / ... / 'Z').
+  MAX_CHUNKS: 4
+};
+
+var protoOut = {
+  queue: [],
+  index: 0,
+  id: '0',
+  type: 'R',
+  total: 0,
+  retries: 0
+};
+
+var protoIn = {
+  buf: '',
+  expected: 0,
+  got: 0,
+  id: '0',
+  type: ''
+};
+
+function protoNextId() {
+  var n = parseInt(Storage.get('protoNextId', '1'), 10);
+  if (!n || n < 1) n = 1;
+  Storage.set('protoNextId', String(n + 1));
+  return String(n);
+}
+
+// Build the chunk envelopes for `body` and start sending them.
+// `onDone` (optional) fires once the last chunk has left the watch/phone, which
+// is what lets callers chain a multi-message batch.
+function protoSend(type, body, onDone) {
+  body = body || '';
+  var id = protoNextId();
+  var total = Math.ceil(body.length / PROTO.CHUNK) || 1;
+  if (total > PROTO.MAX_CHUNKS) {
+    // Refuse instead of truncating: a silently shortened routine is exactly the
+    // bug class this protocol exists to remove.
+    console.log('PROTO: transfer of ' + body.length + ' chars exceeds the ' +
+                (PROTO.MAX_CHUNKS * PROTO.CHUNK) + '-char limit');
+    if (onDone) onDone();
+    return;
+  }
+
+  protoOut.queue = [];
+  for (var i = 0; i < total; i++) {
+    var slice = body.substr(i * PROTO.CHUNK, PROTO.CHUNK);
+    protoOut.queue.push(
+      PROTO.VERSION + '|' + type + '|' + id + '|' + (i + 1) + '/' + total + '|' + slice
+    );
+  }
+  protoOut.index   = 0;
+  protoOut.id      = id;
+  protoOut.type    = type;
+  protoOut.total   = total;
+  protoOut.retries = 0;
+  protoOut.onDone  = onDone || null;
+  protoSendNext();
+}
+
+function protoSendNext() {
+  if (protoOut.index >= protoOut.queue.length) {
+    console.log('PROTO: sent ' + protoOut.total + ' chunk(s) for ' + protoOut.id);
+    var done = protoOut.onDone;
+    protoOut.onDone = null;
+    if (done) done();
+    return;
+  }
+
+  var msg = {};
+  msg.PROTO_MESSAGE = protoOut.queue[protoOut.index];
+
+  Pebble.sendAppMessage(msg, function() {
+    protoOut.index++;
+    protoSendNext();
+  }, function(err) {
+    if (protoOut.retries < 3) {
+      protoOut.retries++;
+      console.log('PROTO: chunk retry ' + protoOut.retries + ' for ' + protoOut.id);
+      protoSendNext();
+    } else {
+      console.log('PROTO: chunk failed permanently for ' + protoOut.id + ': ' + JSON.stringify(err));
+      var done = protoOut.onDone;
+      protoOut.onDone = null;
+      if (done) done();
+    }
+  });
+}
+
+function protoAck(id) {
+  Pebble.sendAppMessage({ PROTO_ACK: String(id) },
+    function() { },
+    function(err) { console.log('PROTO: ack failed: ' + JSON.stringify(err)); });
+}
+
+// Send a batch as 'M' (open) -> 'R' per routine -> 'Z' (commit).
+// Transfers are chained one at a time because the AppMessage outbox allows a
+// single in-flight message. The watch buffers one routine at a time and only
+// commits the library when 'Z' arrives, so a batch can never half-wipe it.
+function sendBatch(batchBody) {
+  var parts = batchBody.split('~').filter(function(s) { return s.length > 0; });
+  var queue = [{ type: 'M', body: String(parts.length) }];
+  for (var i = 0; i < parts.length; i++) queue.push({ type: 'R', body: parts[i] });
+  queue.push({ type: 'Z', body: '0' });
+
+  storageBatchQueue = queue;
+  protoSendNextBatch();
+}
+
+var storageBatchQueue = [];
+
+function protoSendNextBatch() {
+  if (!storageBatchQueue || storageBatchQueue.length === 0) {
+    storageBatchQueue = [];
+    return;
+  }
+  var next = storageBatchQueue.shift();
+  protoSend(next.type, next.body, function() { protoSendNextBatch(); });
+}
+
+// Parse and reassemble an inbound envelope. Returns the completed body, or
+// null while more chunks are outstanding.
+function protoReassemble(envelope) {
+  // Split only on the first four delimiters so the body is preserved verbatim.
+  var parts = envelope.split('|');
+  if (parts.length < 5) return null;
+
+  var ver   = parseInt(parts[0], 10);
+  var type  = parts[1];
+  var id    = parts[2];
+  var seqT  = parts[3].split('/');
+  var seq   = parseInt(seqT[0], 10);
+  var total = parseInt(seqT[1], 10);
+  var body  = parts.slice(4).join('|');
+
+  if (!ver || ver < 1 || ver > PROTO.VERSION) {
+    console.log('PROTO: refusing envelope version ' + parts[0] + ' (we speak ' + PROTO.VERSION + ')');
+    return null;
+  }
+  if (!total || total > PROTO.MAX_CHUNKS || !seq || seq > total) return null;
+
+  if (seq === 1) {
+    protoIn.buf = '';
+    protoIn.expected = total;
+    protoIn.got = 0;
+    protoIn.id = id;
+    protoIn.type = type;
+  } else if (protoIn.expected !== total || protoIn.id !== id || protoIn.type !== type ||
+             protoIn.got !== seq - 1) {
+    // Out of sequence, or a retried duplicate of a chunk we already have.
+    console.log('PROTO: unexpected chunk ' + seq + '/' + total + ' for ' + id + ', ignoring');
+    return null;
+  }
+
+  protoIn.buf += body;
+  protoIn.got++;
+
+  if (protoIn.got >= protoIn.expected) {
+    var complete = { type: protoIn.type, id: protoIn.id, body: protoIn.buf };
+    protoIn.buf = '';
+    protoIn.expected = 0;
+    protoIn.got = 0;
+    return complete;
+  }
+  return null;
+}
+
 // PEBBLE EVENT LISTENERS
 // ============================================================
 
@@ -253,32 +432,145 @@ Pebble.addEventListener('webviewclosed', function(e) {
     Storage.setJSON('synced_routines', configData.updatedSync);
   }
 
-  // --- Send data to watch ---
-  var appMessageData = {};
-
-  if (configData.routineData && configData.routineData !== '') {
-    appMessageData['ROUTINE_DATA'] = configData.routineData;
-  }
+  // --- Settings (unchanged, always tiny) ---
+  // Sent as their own messages: they are two ints, so chunking them with the
+  // routine would only waste an envelope round trip.
+  var settingsData = {};
   if (configData.progressionMode !== undefined) {
-    appMessageData['PROGRESSION_MODE'] = parseInt(configData.progressionMode, 10);
+    settingsData['PROGRESSION_MODE'] = parseInt(configData.progressionMode, 10);
   }
   if (configData.weightIncrement !== undefined) {
-    appMessageData['WEIGHT_INCREMENT'] = parseInt(configData.weightIncrement, 10);
+    settingsData['WEIGHT_INCREMENT'] = parseInt(configData.weightIncrement, 10);
   }
-
-  if (Object.keys(appMessageData).length > 0) {
-    Pebble.sendAppMessage(appMessageData,
-                          function()    { console.log('Data sent to watch successfully.'); },
-                          function(err) { console.log('Failed to send data to watch: ' + JSON.stringify(err)); }
+  if (Object.keys(settingsData).length > 0) {
+    Pebble.sendAppMessage(settingsData,
+                          function()    { console.log('Progression settings sent.'); },
+                          function(err) { console.log('Failed to send settings: ' + JSON.stringify(err)); }
     );
   }
+
+  // --- Routine / batch / tombstones (v7.0.0 protocol, chunked) ---
+  // The config page parks the routine in localStorage instead of the
+  // pebblejs://close# URL, so it is no longer limited by the URL truncation
+  // that silently dropped large routines (issues #42/#43).
+  //
+  // A batch is sent as ONE 'M' (batch-open) message followed by one 'R' per
+  // routine and a 'Z' (batch-close) message. That way the watch only ever has
+  // to buffer a single routine (2 KB) instead of a whole batch (~9 KB), which
+  // matters a lot on 64 KB devices. The watch validates as it goes and only
+  // commits the library when 'Z' arrives.
+  var routineStr = Storage.get('pendingRoutine', '');
+  if (configData.pendingRoutine || (configData.routineData && configData.routineData !== '')) {
+    if (!routineStr && configData.routineData) routineStr = configData.routineData;
+
+    if (routineStr) {
+      if (routineStr.indexOf('BATCH~') === 0) {
+        sendBatch(routineStr.substring(6));
+      } else {
+        protoSend('R', routineStr);
+      }
+      Storage.remove('pendingRoutine');
+    }
+  }
+
+  // Deletes made on the phone are the authoritative ones, so they are the only
+  // deletion that is pushed to the watch (the watch's own deletes stay local).
+  var pendingDeletes = Storage.getJSON('pendingDeletedRoutines', []);
+  if (configData.pendingDeletes && pendingDeletes.length > 0) {
+    protoSend('S', pendingDeletes.join('|'));
+    Storage.setJSON('pendingDeletedRoutines', []);
+  }
 });
+
+// 4. Message received FROM the watch
+// ============================================================
+// PROGRESSION DELTA  (watch -> phone, the only routine-shaped
+// message that comes back from the watch)
+// "<routine>|<prog>|<inc>|<name>|<reps'>|<weight'>|..."
+// Only targets change: the exercise LIST is never replaced, so the
+// phone stays the single source of truth for routine definitions.
+// ============================================================
+function applyProgressionDelta(body) {
+  var parts = body.split('|');
+  if (parts.length < 3) return;
+
+  var routineName = parts[0];
+  var mode        = parseInt(parts[1], 10);
+  var increment   = parseInt(parts[2], 10);
+
+  var savedRoutines = Storage.getJSON('savedRoutines', []);
+  var routine = null;
+  for (var i = 0; i < savedRoutines.length; i++) {
+    if (savedRoutines[i].name === routineName) { routine = savedRoutines[i]; break; }
+  }
+  if (!routine) {
+    console.log('Progression delta for unknown routine, ignoring: ' + routineName);
+    return;
+  }
+
+  if (!isNaN(mode))      routine.progressionMode = String(mode);
+  if (!isNaN(increment)) routine.weightIncrement = String(increment);
+
+  // Triples after the header: name, target reps, target weight.
+  var applied = 0;
+  for (var p = 3; p + 2 < parts.length; p += 3) {
+    var exName = parts[p];
+    var reps   = parseInt(parts[p + 1], 10);
+    var weight = parseInt(parts[p + 2], 10);
+
+    for (var e = 0; e < (routine.exercises || []).length; e++) {
+      var ex = routine.exercises[e];
+      if (String(ex[0]) !== String(exName)) continue;
+      if (!isNaN(reps))   ex[2] = reps;
+      if (!isNaN(weight)) ex[3] = weight;
+      applied++;
+      break;
+    }
+  }
+
+  Storage.setJSON('savedRoutines', savedRoutines);
+  Storage.set('lastRoutine', routineName);
+  console.log('Applied progression delta to ' + routineName + ' (' + applied + ' exercise(s))');
+}
+
+// ============================================================
+// PEBBLE EVENT LISTENERS
+// ============================================================
 
 // 4. Message received FROM the watch
 Pebble.addEventListener('appmessage', function(e) {
   var payload = e.payload;
 
-  // --- Workout complete ---
+  // --- v7.0.0 protocol envelope (chunked) ---
+  if (payload.PROTO_MESSAGE) {
+    var complete = protoReassemble(payload.PROTO_MESSAGE);
+    if (!complete) return;
+
+    protoAck(complete.id);
+
+    if (complete.type === 'W') {
+      // Workout report: same payload shape as the old WORKOUT_SUMMARY, so the
+      // existing CSV/Sheets consumers keep working unchanged.
+      console.log('WORKOUT REPORT. Received ' + complete.body.length + ' chars.');
+      saveWorkoutLocally(complete.body);
+      exportToGoogleSheets(complete.body);
+    } else if (complete.type === 'P') {
+      applyProgressionDelta(complete.body);
+    } else if (complete.type === 'R' || complete.type === 'B') {
+      // A v7 watch never sends routine definitions. If one arrives it is from
+      // a buggy/mismatched build; log it rather than corrupt the library.
+      console.log('Ignoring inbound routine envelope type ' + complete.type + ' (phone is source of truth)');
+    }
+    return;
+  }
+
+  // --- v7.0.0 acknowledgement of something we sent ---
+  if (payload.PROTO_ACK) {
+    console.log('PROTO: watch acknowledged ' + payload.PROTO_ACK);
+    return;
+  }
+
+  // --- Legacy keys (v6 watch firmware) ---
   if (payload.WORKOUT_SUMMARY) {
     var rawData = payload.WORKOUT_SUMMARY;
     console.log('WORKOUT COMPLETE. Received ' + rawData.length + ' chars.');
@@ -286,80 +578,16 @@ Pebble.addEventListener('appmessage', function(e) {
     exportToGoogleSheets(rawData);
   }
 
-  // --- Two-Way Sync: routine sent from watch ---
   if (payload.ROUTINE_DATA) {
     var syncString  = payload.ROUTINE_DATA;
     var routineName = syncString.split('|')[0];
 
-    // Always persist the raw string as a safety fallback
+    // Persist the raw string as a fallback for the legacy seeding path.
     var syncedRoutines = Storage.getJSON('synced_routines', {});
     syncedRoutines[routineName] = syncString;
     Storage.setJSON('synced_routines', syncedRoutines);
-    console.log('Two-Way Sync saved for: ' + routineName);
 
-    // Always apply progression updates to savedRoutines
     var parsed = parseRoutineString(syncString);
-    if (parsed) {
-      autoSyncRoutine(syncString, routineName, parsed);
-    }
-  }
-
-  // --- Voice Add Exercise: parse spoken text and beam a new exercise back to the watch ---
-  if (payload.VOICE_ADD_EXERCISE) {
-    var spokenText = payload.VOICE_ADD_EXERCISE.toLowerCase();
-    console.log('Voice dictation received: ' + spokenText);
-
-    // Convert written numbers to digits for easier regex matching
-    var numWords = {
-      'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,
-      'eight':8,'nine':9,'ten':10,'eleven':11,'twelve':12,
-      'fifteen':15,'twenty':20,'thirty':30,'forty':40,'fifty':50
-    };
-    for (var word in numWords) {
-      spokenText = spokenText.replace(new RegExp('\\b' + word + '\\b', 'gi'), numWords[word]);
-    }
-
-    var exerciseName = 'Unknown Exercise';
-    var sets = 3, reps = 10, weight = 0;
-
-    var setsMatch   = spokenText.match(/(\d+)\s*sets?/);
-    if (setsMatch) sets = parseInt(setsMatch[1], 10);
-    if (sets > 10) sets = 10;  // the watch stores at most 10 sets per exercise
-    if (sets < 1)  sets = 1;
-
-    var repsMatch   = spokenText.match(/(\d+)\s*reps?/);
-    if (!repsMatch) repsMatch = spokenText.match(/sets? of (\d+)/);
-    if (repsMatch)  reps = parseInt(repsMatch[1], 10);
-
-    var weightMatch = spokenText.match(/(\d+)\s*(kilos?|kg|lbs?|pounds?|weight)/);
-    if (weightMatch) {
-      weight = parseInt(weightMatch[1], 10);
-    } else if (spokenText.indexOf('bodyweight') !== -1 || spokenText.indexOf('body weight') !== -1) {
-      weight = 0;
-    }
-
-    var nameMatch = spokenText.match(/^(.*?)\s*\d+\s*sets?/);
-    if (nameMatch && nameMatch[1]) {
-      exerciseName = nameMatch[1];
-    } else {
-      exerciseName = spokenText.substring(0, 20);
-    }
-
-    // Strip trailing punctuation the dictation service inserts after the
-    // exercise name (e.g. "bicep curls, 3 sets of 10" -> "bicep curls").
-    exerciseName = exerciseName.replace(/[\s,.;:!?]+$/g, '').trim();
-    if (!exerciseName) exerciseName = 'Unknown Exercise';
-
-    // Capitalise first letter of each word
-    exerciseName = exerciseName.replace(/\b\w/g, function(l) { return l.toUpperCase(); });
-
-    var newExString = exerciseName + '|' + sets + '|' + reps + '|' + weight + '|0|-';
-    console.log('Parsed exercise: ' + newExString);
-
-    Pebble.sendAppMessage(
-      { 'NEW_EXERCISE_DATA': newExString },
-      function()    { console.log('Sent parsed exercise back: ' + newExString); },
-                          function(err) { console.log('Failed to send parsed exercise: ' + JSON.stringify(err)); }
-    );
+    if (parsed) autoSyncRoutine(syncString, routineName, parsed);
   }
 });
