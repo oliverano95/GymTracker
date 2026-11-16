@@ -330,15 +330,17 @@ const MAX_EXERCISES   = 15;    // mirrors #define MAX_EXERCISES in main.c
 const MAX_SETS        = 10;    // mirrors the 10-entry actual_reps/actual_weight arrays in main.c
 const MAX_HISTORY     = 30;
 
-// Hard cap on the ENCODED config response (the pebblejs://close# payload).
-// The phone app silently drops responses above a platform limit, so a too-long
-// routine appeared to "save" while the watch never received it. Measurements
-// from a real device: 252 and 279 encoded chars delivered fine, 672 was
-// silently dropped — the true limit sits between them (suspected 512, to be
-// confirmed via the pkjs webviewclosed length log). The cap is conservative;
-// note encodeURIComponent inflates pipes/spaces/commas ~2.1x, so the routine
-// string itself must stay well under ~200 raw chars.
+// v7.0.0: the pebblejs://close# response is still the transport out of the
+// webview, so it must stay reasonably small — but it no longer has to carry a
+// whole routine. The routine is written to localStorage here and handed to the
+// phone app in chunks afterwards, so this cap now only guards against a
+// pathological settings blob (google creds + history + a routine string).
+// Measured on a real device: 252 and 279 encoded chars deliver, 672 does not.
 const MAX_CONFIG_RESPONSE = 450;
+
+// Settings blobs that legitimately exceed the cap (large workout history) are
+// trimmed rather than blocked — see buildConfigPayload.
+const MAX_HISTORY_IN_PAYLOAD = 5;
 
 /** Modifier value → { label, badgeClass } */
 const MODIFIER_META = {
@@ -1029,12 +1031,14 @@ function serialiseRoutine(name, exercises) {
 // BUILD CONFIG PAYLOAD  (shared by single send and batch)
 // ============================================================
 function buildConfigPayload(routineData) {
-    // Only include fields that are actually set. The response rides the
-    // pebblejs://close# URL, which the phone app silently truncates past a
-    // platform limit, so every unnecessary character shrinks how much
-    // routine data can be delivered. Google creds are persisted phone-side
-    // in webviewclosed (index.js) regardless, so empty/unset values are
-    // simply omitted here.
+    // Only include fields that are actually set. The response still rides the
+    // pebblejs://close# URL, so unnecessary characters cost headroom; google
+    // creds are persisted phone-side in webviewclosed (index.js) regardless,
+    // so empty/unset values are simply omitted here.
+    //
+    // v7.0.0: the routine is NOT included by default — it goes through
+    // localStorage ('pendingRoutine') and is chunked by pkjs. `routineData`
+    // remains supported for callers/tests that pass it explicitly.
     const payload = {
         progressionMode: document.getElementById('progressionMode').value,
         weightIncrement: document.getElementById('weightIncrement').value
@@ -1046,14 +1050,48 @@ function buildConfigPayload(routineData) {
     if (googlePwd)  payload.googlePwd  = googlePwd;
     if (shouldClearHistory) payload.clearHistory = true;
     if (shouldClearGoogle)  payload.clearGoogle  = true;
+
+    // Publish the routine (and phone-side deletes) for the phone app to pick up.
+    payload.pendingRoutine    = true;
+    payload.pendingDeletes    = collectDeletedForWatch().length > 0;
     return payload;
+}
+
+// v7.0.0: routine payloads no longer ride the pebblejs://close# URL (that was
+// the source of the silent-truncation bug class). They are parked in
+// localStorage and pkjs sends them to the watch in chunks once the webview
+// closes, so routine size is no longer bounded by the config-response limit.
+function sendRoutineToPebble(routineStr) {
+    Storage.set('pendingRoutine', routineStr);
+    Storage.set('pendingDeletedRoutines', JSON.stringify(collectDeletedForWatch()));
+    sendToPebble(buildConfigPayload());
+}
+
+// Routines deleted on the phone must also disappear from the watch. The watch
+// is the authority for nothing, so this is a one-way push (the 'S' envelope).
+function collectDeletedForWatch() {
+    return Storage.getJSON('deletedSyncKeys', []);
 }
 
 function sendToPebble(configData) {
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
-    const encoded  = encodeURIComponent(JSON.stringify(configData));
+
+    // v7.0.0: the routine itself no longer rides this URL — pkjs picks the
+    // routine up from localStorage (see 'pendingRoutine' below) and sends it
+    // chunked. So if the blob is still too long it is the history that is
+    // oversized; drop the oldest entries instead of refusing to save.
+    let guard = 0;
+    let encoded = encodeURIComponent(JSON.stringify(configData));
+
+    while (encoded.length > MAX_CONFIG_RESPONSE && guard < MAX_HISTORY && configData.history) {
+        configData.history.shift();
+        if (configData.history.length === 0) delete configData.history;
+        encoded = encodeURIComponent(JSON.stringify(configData));
+        guard++;
+    }
+
     if (encoded.length > MAX_CONFIG_RESPONSE) {
-        alert(`⚠️ Settings payload is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer (longer responses are silently dropped and never reach the watch). Please shorten exercise names/comments or split the routine.`);
+        alert(`⚠️ Settings are ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer. This is usually a very long Google Sheets URL; please shorten it.`);
         return;
     }
     window.location.href = returnTo + encoded;
@@ -1212,7 +1250,7 @@ function saveAndSendSingle() {
         document.getElementById('progressionMode').value,
         document.getElementById('weightIncrement').value);
     loadSavedRoutines();
-    sendToPebble(buildConfigPayload(routineStr));
+    sendRoutineToPebble(routineStr);
 }
 
 // ============================================================
@@ -1271,7 +1309,7 @@ function sendBatchToPebble() {
         alert('Your batch is empty! Add routines from the Builder first.'); return;
     }
     const finalStr = 'BATCH~' + batchRoutines.map(r => r.dataStr).join('~');
-    sendToPebble(buildConfigPayload(finalStr));
+    sendRoutineToPebble(finalStr);
 }
 
 // ============================================================
@@ -1642,14 +1680,13 @@ window.addEventListener('load', () => {
             return;
         }
 
-        // Local copy exists: merge. Match each sync exercise against the
-        // local copy using stable identity fields only (name, sets,
-        // modifier, comment). Reps and weight are progression values the
-        // watch may auto-update, so they are excluded from the identity
-        // check and merged from the sync when they differ. This preserves
-        // renames, reorderings, deletions, and comment edits made on the
-        // phone, while still picking up the watch's auto-progression for
-        // both reps and weight.
+        // Local copy exists: overlay ONLY the progression values.
+        // v7.0.0: the phone is the single source of truth for routine
+        // definitions, so the watch can no longer add, rename, reorder or
+        // remove exercises. The only thing it still reports is auto-progression
+        // of target reps/weight, which is merged here by exercise identity
+        // (name, sets, modifier, comment). Anything extra the watch reports is
+        // ignored — that eliminates the resurrection/duplication bugs (#46).
         let merged = false;
         const mergedExercises = (localRoutine.exercises || []).map(migrateLegacyExercise);
         for (let i = 0; i < syncExercises.length && i < mergedExercises.length; i++) {
@@ -1670,14 +1707,6 @@ window.addEventListener('load', () => {
                     merged = true;
                 }
             }
-        }
-
-        // Voice-added exercises are appended by the watch at the end of the
-        // routine, so any sync entries beyond the local copy's length are
-        // new exercises and must be adopted rather than dropped.
-        for (let i = mergedExercises.length; i < syncExercises.length; i++) {
-            mergedExercises.push(migrateLegacyExercise(syncExercises[i]));
-            merged = true;
         }
 
         if (merged) {
