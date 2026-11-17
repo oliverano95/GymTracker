@@ -4,7 +4,7 @@
 // CONFIGURATION
 // ============================================================
 var CONFIG = {
-  isDevMode: true,   // TEMP: beta always links to index_dev.html
+  isDevMode: false,
   configUrlDev:  'https://oliverano95.github.io/GymTracker/index_dev.html',
   configUrlProd: 'https://oliverano95.github.io/GymTracker/',
   maxHistory: 15
