@@ -4,7 +4,9 @@ const path = require('path');
 
 module.exports = defineConfig({
   testDir: '.',
-  testMatch: ['test-config-page.js', 'emulator.js', 'test-csv-export.js', 'test-e2e.js'],
+  // Only suites that exist on this branch. (test-protocol.js ships with the
+  // watch/pkjs changes on `beta`; add it here when those are merged.)
+  testMatch: ['test-config-page.js', 'emulator.js', 'test-csv-export.js', 'test-e2e.js', 'test-delete-rename.js'],
   timeout: 60_000,
   expect: { timeout: 5_000 },
   fullyParallel: false,
