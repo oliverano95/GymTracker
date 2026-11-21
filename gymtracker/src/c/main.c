@@ -580,7 +580,9 @@ static void parse_routine_string(const char *data) {
           else if (field == 4) {
             ex->modifier = atoi(temp);
             if (ex->modifier == 4) { ex->modifier = 0; ex->target_weight = 0; }
-            if (ex->modifier == 6) { ex->target_weight = 0; }
+            // 6 = timed (count up), 8 = timed (count down, issue #61): both
+            // time an unweighted hold, so weight is never part of the set.
+            if (ex->modifier == 6 || ex->modifier == 8) { ex->target_weight = 0; }
             if (ex->modifier == 1) {
               ex->target_sets *= 2;
             }
@@ -767,6 +769,10 @@ static void init_temp_values(Exercise *ex) {
   // Modifiers and Final Assignment
   if (ex->modifier == 6) {
     s_app.state.temp_reps = 0;
+  } else if (ex->modifier == 8) {
+    // Count down: temp_reps holds the REMAINING seconds, so a set starts at
+    // the target and ticks towards zero (pre-fill does not apply to a timer).
+    s_app.state.temp_reps = ex->target_reps;
   } else {
     s_app.state.temp_reps = base_reps;
     
@@ -1209,9 +1215,18 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 
     if (s_app.state.is_timed_active) {
       if (s_app.state.curr_ex_idx < s_app.state.total_exercises) {
-        s_app.state.temp_reps++;
-        if (s_app.state.temp_reps == s_app.state.exercises[s_app.state.curr_ex_idx].target_reps)
-          vibes_long_pulse();
+        Exercise *tex = &s_app.state.exercises[s_app.state.curr_ex_idx];
+        if (tex->modifier == 8) {
+          // Count down: temp_reps is the REMAINING time. Below zero it keeps
+          // its sign and its magnitude is the overtime performed so far.
+          s_app.state.temp_reps--;
+          if (s_app.state.temp_reps == 0)
+            vibes_double_pulse();   // target reached: louder/longer than count up
+        } else {
+          s_app.state.temp_reps++;
+          if (s_app.state.temp_reps == tex->target_reps)
+            vibes_long_pulse();
+        }
         update_workout_ui(false);
       }
     }
@@ -1988,6 +2003,10 @@ static void summary_window_load(Window *window) {
 
   for (int i = 0; i < s_app.state.total_exercises; i++) {
     int ex_misses = 0;
+    // Elapsed time of the last set of this exercise (a count-down stores the
+    // remaining seconds while in progress, so the elapsed value is derived).
+    int in_progress_reps = 0;
+    int in_progress_slot = 0;
     for (int j = 0; j < s_app.state.exercises[i].target_sets; j++) {
       int a_r = s_app.state.exercises[i].actual_reps[j];
       int a_w = s_app.state.exercises[i].actual_weight[j];
@@ -2007,16 +2026,24 @@ static void summary_window_load(Window *window) {
       total_target_reps += t_r;
       total_actual_reps += a_r;
       total_volume      += (int32_t)a_r * (int32_t)a_w;   // FIX #4: 32-bit multiply
+      in_progress_reps   = a_r;
+      in_progress_slot   = j;
 
       if      (a_w > t_w || (a_w == t_w && a_r > t_r)) sets_above++;
       else if (a_w < t_w || (a_w == t_w && a_r < t_r)) { sets_below++; ex_misses++; }
     }
 
     if (s_app.settings.progression_mode != -1 && ex_misses == 0) {
-      if (s_app.state.exercises[i].modifier == 6) {
+      if (s_app.state.exercises[i].modifier == 6 || s_app.state.exercises[i].modifier == 8) {
         int increase = (s_app.state.exercises[i].target_reps * 5) / 100;
         if (increase < 1) increase = 1;
         s_app.state.exercises[i].target_reps += increase;
+        // A count-down keeps its last result in actual_reps (the value the
+        // phone may use for pre-fill), so make sure it never carries a 0 left
+        // over from an untouched slot: it is at least the elapsed time.
+        if (s_app.state.exercises[i].modifier == 8 &&
+            s_app.state.exercises[i].actual_reps[in_progress_slot] < in_progress_reps)
+          s_app.state.exercises[i].actual_reps[in_progress_slot] = in_progress_reps;
         s_app.state.exercises[i].dirty = true;   // OPT #5
       } else if (s_app.settings.progression_mode == 0) {
         if (s_app.state.exercises[i].target_weight > 0) {
@@ -2090,6 +2117,7 @@ static void summary_window_load(Window *window) {
     if      (s_app.state.exercises[i].modifier == 1) mod_label = " [DROP]";
     else if (s_app.state.exercises[i].modifier == 2) mod_label = " [SUPER]";
     else if (s_app.state.exercises[i].modifier == 6) mod_label = " [TIMED]";
+    else if (s_app.state.exercises[i].modifier == 8) mod_label = " [TIMED-DOWN]";
     else if (s_app.state.exercises[i].modifier == 7) mod_label = " [GIANT]";
     written = snprintf(export_buf + offset, limit - offset, "|%s%s",
                        s_app.state.exercises[i].name, mod_label);
@@ -3230,15 +3258,27 @@ static void update_workout_ui(bool animate_box) {
     snprintf(set_buf, sizeof(set_buf), "Set %d of %d (DROP)", ex->current_set, ex->target_sets);
   } else if (ex->modifier == 3) {
     snprintf(set_buf, sizeof(set_buf), "Set %d of %d (WARM)", ex->current_set, ex->target_sets);
+  } else if (ex->modifier == 8) {
+    // Count down: the arrow makes the direction obvious at a glance, next to
+    // the Target value which stays where it is.
+    snprintf(set_buf, sizeof(set_buf), "Set %d of %d (TIMED \xe2\x96\xbc)", ex->current_set, ex->target_sets);
   } else {
     snprintf(set_buf, sizeof(set_buf), "Set %d of %d", ex->current_set, ex->target_sets);
   }
   text_layer_set_text(s_app.ui.set_layer, set_buf);
-  text_layer_set_text(s_app.ui.label_reps_layer, (ex->modifier == 6) ? "Secs" : "Reps");
+  text_layer_set_text(s_app.ui.label_reps_layer, (ex->modifier == 6 || ex->modifier == 8) ? "Secs" : "Reps");
 
   static char t_reps_buf[32], t_weight_buf[32], reps_buf[16], weight_buf[16];
   snprintf(t_reps_buf,   sizeof(t_reps_buf),   "Target: %d", active_target_reps);
-  snprintf(reps_buf,     sizeof(reps_buf),     "%d",          s_app.state.temp_reps);
+  // Count down shows the time left as mm:ss (at most a couple of minutes) and,
+  // once the target is reached, the overtime as +mm:ss.
+  if (ex->modifier == 8) {
+    int secs  = (s_app.state.temp_reps < 0) ? -s_app.state.temp_reps : s_app.state.temp_reps;
+    const char *sign = (s_app.state.temp_reps < 0) ? "+" : "";
+    snprintf(reps_buf, sizeof(reps_buf), "%s%d:%02d", sign, secs / 60, secs % 60);
+  } else {
+    snprintf(reps_buf, sizeof(reps_buf), "%d", s_app.state.temp_reps);
+  }
   snprintf(t_weight_buf, sizeof(t_weight_buf), "Target: %d", active_target_weight);
   snprintf(weight_buf,   sizeof(weight_buf),   "%d",          s_app.state.temp_weight);
 
@@ -3389,6 +3429,17 @@ static void wo_up_click(ClickRecognizerRef r, void *ctx) {
 }
 static void wo_down_click(ClickRecognizerRef r, void *ctx) {
   if (s_app.state.is_resting) return;
+  if (s_app.state.edit_mode == 0 && s_app.state.curr_ex_idx < s_app.state.total_exercises &&
+      s_app.state.exercises[s_app.state.curr_ex_idx].modifier == 8) {
+    // Count down, timer running: shorten the set. Undoes overtime first and
+    // never runs the remaining time below the point where the buzz would
+    // fire again (that is, it stops at 1, not 0).
+    if (s_app.state.is_timed_active && s_app.state.temp_reps > 1) {
+      s_app.state.temp_reps--;
+      update_workout_ui(false);
+    }
+    return;
+  }
   if (s_app.state.is_timed_active) return;
   if (s_app.state.edit_mode == 0 && s_app.state.temp_reps   > 0) s_app.state.temp_reps--;
   else if (s_app.state.edit_mode == 1 && s_app.state.temp_weight > 0) s_app.state.temp_weight--;
@@ -3399,14 +3450,28 @@ static void wo_down_long_click(ClickRecognizerRef r, void *ctx) { execute_shortc
 
 static void wo_select_short_click(ClickRecognizerRef r, void *ctx) {
   if (s_app.state.is_resting) { skip_rest(); return; }
-  if (s_app.state.curr_ex_idx < s_app.state.total_exercises &&
-      s_app.state.exercises[s_app.state.curr_ex_idx].modifier == 6) {
-    s_app.state.is_timed_active = !s_app.state.is_timed_active;
-  } else if (s_app.state.curr_ex_idx < s_app.state.total_exercises &&
-             s_app.state.exercises[s_app.state.curr_ex_idx].target_weight == 0) {
-    s_app.state.edit_mode = 0;
-  } else {
-    s_app.state.edit_mode = !s_app.state.edit_mode;
+  if (s_app.state.curr_ex_idx < s_app.state.total_exercises) {
+    Exercise *xex = &s_app.state.exercises[s_app.state.curr_ex_idx];
+    if (xex->modifier == 6) {
+      s_app.state.is_timed_active = !s_app.state.is_timed_active;
+    } else if (xex->modifier == 8) {
+      // A running count-down is stopped first, and the set is recorded on the
+      // elapsed time at that point (target - remaining, which is target +
+      // overtime once past zero), so a set can never stay "running" into the
+      // next one.
+      if (s_app.state.is_timed_active) {
+        s_app.state.is_timed_active = false;
+        s_app.state.temp_reps = xex->target_reps - s_app.state.temp_reps;
+        perform_finish_set();
+        return;
+      }
+      s_app.state.is_timed_active = true;
+      s_app.state.temp_reps = xex->target_reps;
+    } else if (xex->target_weight == 0) {
+      s_app.state.edit_mode = 0;
+    } else {
+      s_app.state.edit_mode = !s_app.state.edit_mode;
+    }
   }
   update_workout_ui(true);
 }

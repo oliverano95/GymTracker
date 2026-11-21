@@ -214,3 +214,55 @@ test.describe('Exercise list rendering', () => {
     await expect(items.first()).toContainText('Bench Press');
   });
 });
+
+// ============================================================
+// 8. TIMED EXERCISES — adding one shows its badge and seconds
+// ============================================================
+test.describe('Timed exercise modifiers', () => {
+  async function addTimedExercise(page, modifier, seconds) {
+    await openConfig(page);
+    await page.evaluate(() => {
+      const sel = document.getElementById('exerciseSelect');
+      sel.appendChild(new Option('Planks', 'Planks'));
+      sel.value = 'Planks';
+    });
+    await page.selectOption('#exerciseModifier', modifier);
+    await page.fill('#targetSets', '3');
+    await page.fill('#targetReps', String(seconds));
+    await page.click('#addUpdateBtn');
+  }
+
+  test('count down option is offered and explained', async ({ page }) => {
+    await openConfig(page);
+
+    await expect(page.locator('#exerciseModifier option[value="8"]')).toHaveText('Timed (Count down)');
+
+    await page.selectOption('#exerciseModifier', '8');
+    await expect(page.locator('#labelTargetReps')).toHaveText('Target Seconds:');
+    await expect(page.locator('#targetWeight')).toHaveValue('0');
+    await expect(page.locator('#modifierDesc')).toContainText('Count down');
+  });
+
+  test('count down exercise is added with a COUNTDOWN badge', async ({ page }) => {
+    await addTimedExercise(page, '8', 60);
+
+    const item = page.locator('.exercise-item').first();
+    await expect(item).toContainText('COUNTDOWN');
+    await expect(item).not.toContainText('BODYWEIGHT');   // weight is ignored, not BW
+    await expect(item).toContainText('60sec');
+
+    const stored = await page.evaluate(() => myRoutine[0]);
+    expect(stored[4]).toBe(8);   // modifier travels to the watch as 8
+    expect(stored[3]).toBe(0);   // weight forced to 0
+  });
+
+  test('count up keeps its own badge', async ({ page }) => {
+    await addTimedExercise(page, '6', 45);
+
+    const item = page.locator('.exercise-item').first();
+    await expect(item).toContainText('TIMED');
+    await expect(item).not.toContainText('COUNTDOWN');
+    await expect(item).toContainText('45sec');
+  });
+});
+
