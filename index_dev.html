@@ -92,6 +92,7 @@
         .badge-bodyweight { background: var(--green); }
         .badge-bw-drop    { background: #6f42c1; }
         .badge-timed      { background: #fd7e14; }
+        .badge-countdown  { background: #fd7e14; opacity: .8; }
 
         /* ── Superset styling ── */
         .superset-link { border-left: 4px solid var(--blue); background: #f4f9ff; }
@@ -184,6 +185,7 @@
             <option value="2">Superset</option>
             <option value="3">Warmup</option>
             <option value="6">Timed (Count up)</option>
+            <option value="8">Timed (Count down)</option>
             <option value="7">Giant Set</option>
         </select>
         <div id="modifierDesc" class="modifier-desc">Standard exercise execution with regular rest periods.</div>
@@ -349,6 +351,7 @@ const MODIFIER_META = {
     2: { desc: '<strong>Superset:</strong> Links this exercise with the <strong>NEXT</strong> exercise. The watch bounces between the two until all sets are done.', borderColor: '#007bff' },
     3: { desc: '<strong>Warmup:</strong> Executes normally but the watch cuts the rest timer in half between sets.', borderColor: '#ffc107' },
     6: { desc: '<strong>Timed Exercise:</strong> "Target Reps" = Target Seconds. Press Select to start the timer. Target Weight is ignored.', borderColor: '#fd7e14' },
+    8: { desc: '<strong>Timed Exercise (Count down):</strong> "Target Reps" = Target Seconds. Press Select to start, then the watch counts down the time left and double-buzzes at zero. Past zero it counts the overtime up with a "+". The set is logged as the total time held. Target Weight is ignored.', borderColor: '#fd7e14' },
     7: { desc: '<strong>Giant Set:</strong> Links this exercise with the <strong>NEXT TWO</strong> exercises. The watch bounces across all three until all sets are done. All three must have the same target sets.', borderColor: '#6f42c1' }
 };
 
@@ -437,14 +440,32 @@ function switchTab(evt, tabId) {
 // ============================================================
 function getSavedRoutines()  { return Storage.getJSON('savedRoutines', []); }
 function getLastRoutine()    { return Storage.get('lastRoutine', ''); }
-function saveRoutineToStorage(name, exercises, progressionMode, weightIncrement) {
+
+// `renameFrom` is set only by the save-and-send path when the editor's name no
+// longer matches the routine it was loaded from. Bulk callers (seeding, batch
+// add) pass nothing, so they can never tombstone by accident.
+function saveRoutineToStorage(name, exercises, progressionMode, weightIncrement, renameFrom) {
     let routines = getSavedRoutines();
     const idx = routines.findIndex(r => r.name === name);
     const data = { name, exercises: exercises.map(migrateLegacyExercise), progressionMode, weightIncrement };
     if (idx >= 0) routines[idx] = data; else routines.push(data);
+
+    // A rename is a delete of the old name plus a create of the new one, so
+    // the watch drops the old slot instead of keeping a duplicate (issue #46).
+    if (renameFrom && renameFrom !== name) {
+        routines = routines.filter(r => r.name !== renameFrom);
+        markDeletedForWatch(renameFrom);
+    }
+    // Writing a name back makes it live again: clear any stale tombstone.
+    unmarkDeletedForWatch(name);
+
     Storage.setJSON('savedRoutines', routines);
     Storage.set('lastRoutine', name);
 }
+
+// The routine currently loaded in the editor, so a rename can be detected.
+// Set by selectRoutine() and by the seeding/import paths.
+let loadedRoutineName = '';
 
 // ============================================================
 // LEGACY MIGRATION
@@ -492,6 +513,7 @@ function selectRoutine() {
         document.getElementById('progressionMode').value = '-1';
         document.getElementById('weightIncrement').value = '2';
         myRoutine = [];
+        loadedRoutineName = '';   // nothing loaded: a later save must not look like a rename
         renderRoutine();
         updateProgressionUI();
         return;
@@ -503,6 +525,7 @@ function selectRoutine() {
     document.getElementById('progressionMode').value    = routine.progressionMode || '-1';
     document.getElementById('weightIncrement').value    = routine.weightIncrement || '2';
     myRoutine = (routine.exercises || []).map(migrateLegacyExercise);
+    loadedRoutineName = name;   // baseline for rename detection
     renderRoutine();
     updateProgressionUI();
     Storage.set('lastRoutine', name);
@@ -515,6 +538,13 @@ function deleteRoutine() {
     let routines = getSavedRoutines().filter(r => r.name !== name);
     Storage.setJSON('savedRoutines', routines);
     if (getLastRoutine() === name) Storage.remove('lastRoutine');
+
+    // The phone owns routine definitions, so this delete must also reach the
+    // watch. It is flushed as an 'S' tombstone on the next send. (A delete made
+    // ON the watch takes the opposite path: it stays local and is never sent
+    // here, so the routine reappears the next time the phone pushes the library.)
+    markDeletedForWatch(name);
+    loadedRoutineName = '';
 
     document.getElementById('routineName').value     = '';
     document.getElementById('progressionMode').value = '-1';
@@ -544,8 +574,9 @@ function updateModifierDesc() {
     desc.innerHTML             = meta.desc;
     desc.style.borderLeftColor = meta.borderColor;
 
-    // UX: adapt form field labels and placeholders to the selected modifier
-    const isTimed    = val === '6';
+    // UX: adapt form field labels and placeholders to the selected modifier.
+    // Timed exercises exist in both directions: 6 counts up, 8 counts down.
+    const isTimed    = val === '6' || val === '8';
     const repsInput  = document.getElementById('targetReps');
     const repsLabel  = document.getElementById('labelTargetReps');
     const weightInput  = document.getElementById('targetWeight');
@@ -664,7 +695,8 @@ function renderRoutine() {
         if (isGiantThirdHalf)      badges += '<span class="mod-badge badge-giant-3">GIANT 3/3</span> ';
         if (modifier === 3)        badges += '<span class="mod-badge badge-warmup">WARMUP</span> ';
         if (modifier === 6)        badges += '<span class="mod-badge badge-timed">TIMED</span> ';
-        if (modifier !== 6 && weight === 0) {
+        if (modifier === 8)        badges += '<span class="mod-badge badge-countdown">COUNTDOWN</span> ';
+        if (modifier !== 6 && modifier !== 8 && weight === 0) {
             badges += modifier === 1
                 ? '<span class="mod-badge badge-bw-drop">BW DROP</span> '
                 : '<span class="mod-badge badge-bodyweight">BODYWEIGHT</span> ';
@@ -698,7 +730,7 @@ function renderRoutine() {
                 ${handle}
                 <div class="exercise-details">
                     <div style="line-height:1.2;margin-bottom:4px;"><strong>${ex[0]}</strong> ${badges}</div>
-                    <div>${ex[1]}s × ${modifier === 6 ? ex[2] + 'sec' : ex[2] + 'r'} @ ${weight === 0 ? (modifier === 6 ? '—' : 'BW') : weight + 'kg'}</div>
+                    <div>${ex[1]}s × ${(modifier === 6 || modifier === 8) ? ex[2] + 'sec' : ex[2] + 'r'} @ ${weight === 0 ? ((modifier === 6 || modifier === 8) ? '—' : 'BW') : weight + 'kg'}</div>
                     ${comment}
                 </div>
             </div>
@@ -753,7 +785,7 @@ function addExercise() {
     const reps     = document.getElementById('targetReps').value;
     const weight   = document.getElementById('targetWeight').value;
     const modifier = parseInt(document.getElementById('exerciseModifier').value, 10);
-    const isTimed  = modifier === 6;
+    const isTimed  = modifier === 6 || modifier === 8;
 
     if (sets === '' || reps === '') {
         alert(isTimed
@@ -1067,10 +1099,36 @@ function sendRoutineToPebble(routineStr) {
     sendToPebble(buildConfigPayload());
 }
 
-// Routines deleted on the phone must also disappear from the watch. The watch
-// is the authority for nothing, so this is a one-way push (the 'S' envelope).
+// v7.0.0: deletes are asymmetric by design.
+//   phone delete  -> pushed to the watch ('S' tombstone), because the phone
+//                    owns routine definitions.
+//   watch delete  -> stays on the watch and is never reported here; the
+//                    routine simply reappears the next time the phone sends
+//                    the library.
+// Every phone-side removal (explicit delete, or the old half of a rename) is
+// recorded in `deletedSyncKeys` and flushed to the watch on the next send.
+const DELETED_SYNC_KEY = 'deletedSyncKeys';
+
 function collectDeletedForWatch() {
-    return Storage.getJSON('deletedSyncKeys', []);
+    return Storage.getJSON(DELETED_SYNC_KEY, []);
+}
+
+// Record a routine name as deleted/renamed-away. Idempotent.
+function markDeletedForWatch(name) {
+    if (!name) return;
+    const deleted = collectDeletedForWatch();
+    if (!deleted.includes(name)) {
+        deleted.push(name);
+        Storage.setJSON(DELETED_SYNC_KEY, deleted);
+    }
+}
+
+// The name is live again (re-created or renamed back): stop tombstoning it,
+// otherwise a later send would delete the routine we just created.
+function unmarkDeletedForWatch(name) {
+    if (!name) return;
+    const deleted = collectDeletedForWatch().filter(n => n !== name);
+    Storage.setJSON(DELETED_SYNC_KEY, deleted);
 }
 
 function sendToPebble(configData) {
@@ -1160,10 +1218,12 @@ function routineMatchesSyncedCopy(name) {
 function getAllRoutineDefinitions() {
     const routines = getSavedRoutines();
     const definitions = {};
-    const deleted = Storage.getJSON('deletedSyncKeys', []);
 
+    // Every routine currently in savedRoutines is exported. `deletedSyncKeys`
+    // is deliberately NOT consulted: it is a single-use outbox for watch
+    // tombstones (cleared once flushed), not a record of what exists, and
+    // filtering on it would silently drop routines from a CSV backup.
     routines.forEach(r => {
-        if (deleted.includes(r.name)) return;
         const parts = [r.name, r.progressionMode || '-1', r.weightIncrement || '2'];
         (r.exercises || []).forEach(ex => {
             parts.push(ex.map(v => v === undefined || v === null ? '' : v).join(':'));
@@ -1246,9 +1306,15 @@ function saveAndSendSingle() {
         }
     }
 
+    // Detect a rename: the editor holds a routine loaded under a different name.
+    // The old name must be tombstoned or the watch would keep both (issue #46).
+    const renameFrom = (loadedRoutineName && loadedRoutineName !== name) ? loadedRoutineName : null;
+
     saveRoutineToStorage(name, myRoutine,
         document.getElementById('progressionMode').value,
-        document.getElementById('weightIncrement').value);
+        document.getElementById('weightIncrement').value,
+        renameFrom);
+    loadedRoutineName = name;   // the new name is the baseline from now on
     loadSavedRoutines();
     sendRoutineToPebble(routineStr);
 }
@@ -1631,10 +1697,15 @@ window.addEventListener('load', () => {
         // empty. Seed any synced routine that has no local copy yet; existing
         // local copies stay authoritative.
         const localNames = new Set(getSavedRoutines().map(r => r.name));
+        const deletedNames = new Set(collectDeletedForWatch());
         const lastBeforeSeed = getLastRoutine();
         let seeded = false;
         for (const [syncName, syncRoutineStr] of Object.entries(syncedRoutinesDict)) {
             if (localNames.has(syncName)) continue;
+            // A routine deleted on the phone is still on the watch (deletes made
+            // on the watch are local-only, and the tombstone may not have been
+            // flushed yet). Do not resurrect it here.
+            if (deletedNames.has(syncName)) continue;
             const parsedSync = parseSyncString(syncRoutineStr);
             if (!parsedSync || parsedSync.exercises.length === 0) continue;
             saveRoutineToStorage(syncName, parsedSync.exercises,
@@ -1670,6 +1741,7 @@ window.addEventListener('load', () => {
                 updateProgressionUI();
             }
             myRoutine = syncExercises;
+            loadedRoutineName = activeName;   // baseline for rename detection
             renderRoutine();
             saveRoutineToStorage(
                 activeName,
