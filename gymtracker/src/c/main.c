@@ -25,25 +25,31 @@
 #define REPORT_STAGED_LEN_KEY       942
 #define REPORT_STAGED_BUF_KEY       943   // occupies 943..(943 + chunks)
 #define REPORT_STAGED_CHUNKS        4     // 4 x 256B = 1024B staged report
+// v8 (protocol 2) sync bookkeeping — see the sequence-number block below.
+#define SYNC_SEQ_PHONE_KEY          948   // newest library sequence applied
+#define SYNC_EPOCH_ACK_KEY          949   // library epoch applied with it
 
 #define NUM_VARIATIONS 9
 
 // ========================================================================= //
-// v7.0.0 wire protocol                                                     //
+// v8 wire protocol (see docs/protocol.md)                                  //
 // ------------------------------------------------------------------------- //
 // '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'                                 //
 // Everything travels as pipe-delimited text so the watch needs no JSON     //
 // parser. The envelope makes each message self-describing, carrying a      //
-// protocol version, a message id (for ACK/NAK) and chunk sequencing.       //
-// See docs/protocol.md for the full contract.                              //
+// protocol version, a message id (for ACK) and chunk sequencing.           //
+//                                                                          //
+// There are exactly TWO routine transfers, and neither needs staging:      //
+//   T  library  phone -> watch : every routine, one '|' segment each      //
+//   W  report   watch -> phone : one workout report                       //
+// plus two int-sized dict messages: progression settings (phone -> watch)  //
+// and HELLO (sequence | epoch, both directions). Stateless beyond that.    //
 // ========================================================================= //
-#define PROTO_VERSION          1
+#define PROTO_VERSION          2
 #define PROTO_CHUNK_PAYLOAD    512   // body chars per chunk (inbox/outbox are 2048)
-// Reassembly buffer size. Kept at the app's existing routine ceiling: a single
-// routine is at most MAX_ROUTINE_LEN (1300) in the config page. Batches are
-// reassembled one SEGMENT at a time by the config page/pkjs (each segment is
-// sent as its own 'R'), so the watch never needs to hold a whole batch in RAM.
-#define PROTO_MAX_CHUNKS       4     // 4 x 512 = 2048 bytes of reassembly buffer
+// Reassembly buffer size. A 'T' library is at most 7 routines x 1300 chars
+// (MAX_ROUTINE_LEN in the config page), i.e. 8 x 512 = 4096 bytes.
+#define PROTO_MAX_CHUNKS       8
 #define PROTO_MAX_RETRIES      3
 #define PROTO_IN_BUF_SIZE      (PROTO_CHUNK_PAYLOAD * PROTO_MAX_CHUNKS)
 
@@ -412,10 +418,11 @@ static void save_routine_to_slot(int slot_idx);
 static void push_ex_action_window(void);
 static void push_timer_edit_window(void);
 
-// v7.0.0 protocol helpers
+// v8 protocol helpers
 static void proto_send(const char *type, const char *body);
 static void proto_send_ack(const char *id);
 static void proto_note_version(int ver);
+static void proto_send_hello(void);
 static void report_stage_and_send(void);
 static void report_retry_staged(void);
 static void report_clear_staged(void);
@@ -423,6 +430,23 @@ static void report_clear_staged(void);
 // Referenced by code that is defined before section 9b.
 static void save_setting(SettingsKey key, int value);
 static char *report_stage_buf;
+
+// ========================================================================= //
+// SYNC SCRATCH ARENA                                                        //
+// ------------------------------------------------------------------------- //
+// The library, the workout report and the inbound reassembly buffer are the  //
+// three biggest strings in the app, and they are never live at the same time: //
+// a library sync only happens when no workout is running, and the summary is //
+// built only after the workout is over. They therefore share one arena       //
+// instead of costing 2 KB each — which is what makes room for the 4 KB       //
+// reassembly buffer on 64 KB hardware (flint).
+//
+// Rule of thumb when touching this code: any handler that has been given the
+// arena by proto_dispatch() owns it until it returns, and must copy anything
+// it needs to keep into persist or into a small buffer of its own.
+// ========================================================================= //
+#define ARENA_SIZE (PROTO_IN_BUF_SIZE + EXPORT_BUF_SIZE)
+static char s_sync_buf[ARENA_SIZE];
 
 // ========================================================================= //
 //                           5. CORE UTILITIES                               //
@@ -1469,8 +1493,9 @@ static void settings_draw_row_callback(GContext *ctx, const Layer *cell_layer,
       case 2: snprintf(title, sizeof(title), "Select Long Press"); snprintf(subtitle, sizeof(subtitle), "%s", actions[s_app.settings.shortcut_select]); break;
     }
   } else if (cell_index->section == 5) {
-    // v7.0.0: a workout that could not reach the phone is staged on the watch.
-    // This row lets the user push it manually (and shows whether one is waiting).
+    // v8: routines are re-synced automatically whenever the phone notices this
+    // watch is behind; this row is only for a workout report that could not
+    // reach the phone yet.
     snprintf(title, sizeof(title), "Resend Last Workout");
     snprintf(subtitle, sizeof(subtitle), "%s",
              persist_exists(REPORT_STAGED_LEN_KEY) ? "Pending sync" : "Nothing pending");
@@ -1620,7 +1645,7 @@ static void settings_select_long_callback(MenuLayer *ml, MenuIndex *cell_index, 
   } else if (cell_index->section == 4) {
     tooltip = "Shortcuts:\nBind a specific action to a long-press of the Up, Down, or Select button during a workout.";
   } else if (cell_index->section == 5) {
-    tooltip = "Phone Sync:\nWorkouts that cannot reach your phone are saved on the watch and sent automatically when it reconnects. Use this to resend manually.";
+    tooltip = "Phone Sync:\nRoutines come from the phone: they are re-sent automatically whenever it notices the watch is out of date.\nWorkouts are saved on the watch if the phone is out of range and sent when it reconnects. Use this to resend manually.";
   }
 
   // Display the tooltip
@@ -2102,9 +2127,13 @@ static void summary_window_load(Window *window) {
   char date_buf[32] = "Unknown Date";
   if (tick_time) strftime(date_buf, sizeof(date_buf), "%Y-%m-%d %H:%M", tick_time);
 
-  // Use static buffers for export/sync to avoid heap pressure.        FIX #1
-  static char export_buf[EXPORT_BUF_SIZE];
-
+  // Use the shared sync arena for the report (see ARENA_SIZE). The routine
+  // report starts at the front; the progression delta, if any, is appended
+  // after it separated by '~', and the finished message is then assembled
+  // back-to-front in place. No workout is running at this point, so nothing
+  // else is using the arena.
+  char *export_buf = s_sync_buf;
+  // Delta room is reserved at the tail so the body can never overwrite it.
   int limit   = EXPORT_BUF_SIZE;
   int written = snprintf(export_buf, limit, "%s|%s|%d|%d|%d|%d",
     s_app.state.routine_name, date_buf, s_app.state.workout_sec,
@@ -2153,20 +2182,29 @@ static void summary_window_load(Window *window) {
   }
 
   // v7.0.0: the routine definition NO LONGER travels watch -> phone. Only the
-  // exercises whose targets actually changed (dirty flag, set by the
-  // progression block earlier in this function) are reported as a 'P' delta,
-  // so the phone stays the single source of truth for routine definitions.
-  // Format: "<routine>|<prog>|<inc>|<name>|<reps'>|<weight'>|..."
+  // targets/progression that actually changed (dirty flag, set by the
+  // progression block earlier in this function) are reported — and they now
+  // ride at the FRONT of the report message instead of in a separate 'P'
+  // transfer, so a workout is exactly one message in each direction. The
+  // config page and pkjs apply them to savedRoutines when the report arrives.
+  //
+  // The delta ends with a djb2 checksum of itself. The phone uses it to tell a
+  // RE-SEND of a report it already applied (identical checksum, dropped) from a
+  // genuinely new one — which is why no commit marker has to live on the watch.
   static char delta_buf[512];
-  int d_off = snprintf(delta_buf, sizeof(delta_buf), "%s|%d|%d",
-                       s_app.state.routine_name,
-                       s_app.settings.progression_mode,
-                       s_app.settings.weight_increment);
+  int d_off = 0;
+  int delta_exercises = 0;
 
   for (int i = 0; i < s_app.state.total_exercises; i++) {
     // Only exercises the progression block actually bumped.
     if (!s_app.state.exercises[i].dirty) continue;
 
+    if (d_off == 0) {
+      d_off = snprintf(delta_buf, sizeof(delta_buf), "%s|%d|%d",
+                       s_app.state.routine_name,
+                       s_app.settings.progression_mode,
+                       s_app.settings.weight_increment);
+    }
     if (d_off > 0 && d_off < (int)sizeof(delta_buf) - 1) {
       int n = snprintf(delta_buf + d_off, sizeof(delta_buf) - d_off, "|%s|%d|%d",
                        s_app.state.exercises[i].name,
@@ -2174,30 +2212,57 @@ static void summary_window_load(Window *window) {
                        s_app.state.exercises[i].target_weight);
       if (n > 0 && n < (int)sizeof(delta_buf) - d_off) {
         d_off += n;
+        delta_exercises++;
       } else {
         d_off = (int)sizeof(delta_buf) - 1;   // full: stop appending
-        break;
       }
     }
 
     // Persist the progressed target so the next session starts from it, then
-    // clear the flag so the same delta is never reported twice.
+    // clear the flag so the same delta is never assembled twice.
     persist_write_data(ROUTINE_EX_BASE + (s_app.state.current_slot * MAX_EXERCISES) + i,
                        &s_app.state.exercises[i], sizeof(Exercise));
     s_app.state.exercises[i].dirty = false;
   }
 
-  // Send the progression delta (if anything progressed) and stage the report.
-  if (d_off > 0) {
-    // Keep a copy: proto_send() copies the body immediately, so the shared
-    // delta_buf being static is safe, but being explicit avoids surprises.
-    proto_send("P", delta_buf);
+  // Append the checksum (skipped if the delta filled the buffer, in which case
+  // the phone treats the delta as unverifiable and applies it).
+  if (delta_exercises > 0) {
+    uint32_t sum = 5381;
+    for (int k = 0; k < d_off; k++) sum = ((sum << 5) + sum) + (uint8_t)delta_buf[k];
+    int n = snprintf(delta_buf + d_off, sizeof(delta_buf) - d_off, "|%lx", (unsigned long)(sum & 0xffffffffu));
+    if (n <= 0 || n >= (int)sizeof(delta_buf) - d_off) delta_exercises = 0;
   }
 
-  report_stage_buf = export_buf;
+  // Assemble the outgoing message in place: "<delta>~<report>" when anything
+  // progressed, else "~<report>". The delta is copied to the reserved tail of
+  // the arena first and the report is then shifted forward by its length, so
+  // no second buffer is needed (2 KB is not affordable on 64 KB hardware).
+  //
+  // Room check: the report was built in the first EXPORT_BUF_SIZE bytes and
+  // the delta goes at offset EXPORT_BUF_SIZE, so shifting the report forward
+  // by (delta_len + 1) needs delta_len + 1 bytes of headroom past its end.
+  int body_len = (int)strlen(export_buf);
+  if (delta_exercises > 0) {
+    int delta_len = (int)strlen(delta_buf);            // fits: delta_buf is 512
+    if (body_len + delta_len + 2 > ARENA_SIZE) delta_len = 0;   // cannot fit both
+    if (delta_len > 0) {
+      memmove(s_sync_buf + EXPORT_BUF_SIZE, delta_buf, (size_t)delta_len);
+      memmove(export_buf + delta_len + 1, export_buf, (size_t)body_len + 1);
+      memmove(export_buf, s_sync_buf + EXPORT_BUF_SIZE, (size_t)delta_len);
+      export_buf[delta_len] = '~';
+    } else {
+      memmove(export_buf + 1, export_buf, (size_t)body_len + 1);
+      export_buf[0] = '~';
+    }
+  } else {
+    memmove(export_buf + 1, export_buf, (size_t)body_len + 1);
+    export_buf[0] = '~';
+  }
 
   // Stage the report before the first send so an unacknowledged workout is
   // resent on reconnect/boot instead of being lost with Bluetooth.
+  report_stage_buf = export_buf;
   report_stage_and_send();
   text_layer_set_text(s_app.ui.sum_info_layer, celebration_buf);
 }
@@ -4018,8 +4083,9 @@ static void push_timer_edit_window(void) {
 // routine-shaped message the watch emits is a 'P' progression delta.        //
 // ========================================================================= //
 
-// Outbound state
-static char s_proto_out_buf[EXPORT_BUF_SIZE];   // body being sent (R/B/W/P)
+// Outbound state. The body being sent lives in the shared sync arena (see
+// ARENA_SIZE): a report is only ever sent while no library sync is running.
+#define s_proto_out_buf  s_sync_buf
 static char s_proto_out_id[8] = "0";
 static uint16_t s_proto_out_seq = 0;
 static uint16_t s_proto_out_total = 0;
@@ -4027,12 +4093,28 @@ static int  s_proto_retries = 0;
 static char s_proto_out_type = 0;
 static uint16_t s_proto_next_id = 1;
 
-// 1 while the current outbound transfer is a workout report (so an ACK clears
-// the staged copy instead of leaving it to be resent forever).
+// 1 while the current outbound transfer is a workout report (so a DONE/ACK
+// clears the staged copy instead of leaving it to be resent forever).
 static bool s_proto_out_is_report = false;
 
-// Inbound reassembly state
-static char s_proto_in_buf[PROTO_IN_BUF_SIZE];
+// ---- message-sequence numbers ----------------------------------------- //
+// The library is versioned by two counters the phone bumps and the watch
+// remembers — `seq` on every send, `epoch` when the user presses Save. Together
+// they let both sides tell a stale message from a fresh one without any
+// timeout, retransmit timer or staging buffer.
+//
+// The durable record of what the watch holds is SYNC_SEQ_PHONE_KEY plus
+// SYNC_EPOCH_ACK_KEY; the phone compares its own (librarySeq, libraryEpoch)
+// against them to decide whether anything is missing.
+static uint32_t s_seq_phone   = 0;
+
+// 1 when the last library the phone offered could not be applied because it is
+// larger than this watch can hold. Reported in HELLO so the phone can stop
+// resending it and tell the user, instead of looping silently forever.
+static bool s_sync_failed = false;
+
+// Inbound reassembly state (the buffer itself is the head of the sync arena).
+#define s_proto_in_buf   s_sync_buf
 static int  s_proto_in_len = 0;
 static uint16_t s_proto_in_expected = 0;
 static uint16_t s_proto_in_got = 0;
@@ -4121,6 +4203,44 @@ static void proto_send_ack(const char *id) {
   app_message_outbox_send();
 }
 
+// HELLO: "here is the library state I hold". The only out-of-band message the
+// watch sends besides reports; the phone compares it with its own state and
+// decides whether to resend the library. Idempotent, so it is safe to send on
+// every opportunity (boot, reconnect, after any transfer).
+//
+// SYNC_FLAGS is non-zero when the phone's last library could not be applied at
+// all (it did not fit), which is the one case where resending is pointless.
+static void proto_send_hello(void) {
+  int32_t have_seq   = persist_exists(SYNC_SEQ_PHONE_KEY)
+                       ? persist_read_int(SYNC_SEQ_PHONE_KEY) : 0;
+  int32_t have_epoch = persist_exists(SYNC_EPOCH_ACK_KEY)
+                       ? persist_read_int(SYNC_EPOCH_ACK_KEY) : 0;
+
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_int32(iter, MESSAGE_KEY_SYNC_SEQUENCE, have_seq);
+  dict_write_int32(iter, MESSAGE_KEY_SYNC_EPOCH,    have_epoch);
+  if (s_sync_failed) dict_write_int32(iter, MESSAGE_KEY_SYNC_FLAGS, 1);
+  app_message_outbox_send();
+}
+
+// Report "I could not take that library" immediately (no user action needed),
+// quoting the phone's own sequence numbers so it can mark them as handled.
+static void proto_send_health(void) {
+  if (!s_sync_failed) return;
+
+  // Adopt the offered numbers as "seen" without changing the library: the
+  // phone then sees a match, stops resending, and shows the warning itself.
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_int32(iter, MESSAGE_KEY_SYNC_SEQUENCE,
+                   persist_exists(SYNC_SEQ_PHONE_KEY) ? persist_read_int(SYNC_SEQ_PHONE_KEY) : 0);
+  dict_write_int32(iter, MESSAGE_KEY_SYNC_EPOCH,
+                   persist_exists(SYNC_EPOCH_ACK_KEY) ? persist_read_int(SYNC_EPOCH_ACK_KEY) : 0);
+  dict_write_int32(iter, MESSAGE_KEY_SYNC_FLAGS, 1);
+  app_message_outbox_send();
+}
+
 // ---- report staging ---------------------------------------------------- //
 
 // Persist the report so it survives a reboot or a phone that is out of range,
@@ -4161,7 +4281,11 @@ static void report_retry_staged(void) {
   int max = (int)sizeof(s_proto_out_buf) - 1;
   if (len <= 0 || len > max) { report_clear_staged(); return; }
 
-  static char staged[REPORT_STAGED_CHUNKS * 256 + 1];
+  // A staged report that was truncated on disk still tells the phone "there
+  // was something you missed"; the sequence is what matters, not the length.
+  // The arena is free here (the report it last held was already staged to
+  // persist), so read the staged copy back into the tail of it.
+  char *staged  = s_sync_buf + PROTO_IN_BUF_SIZE;
   int off = 0;
   for (int c = 0; c < REPORT_STAGED_CHUNKS && off < len; c++) {
     int got = persist_read_data(REPORT_STAGED_BUF_KEY + c, staged + off, 256);
@@ -4171,15 +4295,33 @@ static void report_retry_staged(void) {
   if (off <= 0) { report_clear_staged(); return; }
   staged[off] = '\0';
 
+  // Tell the phone up front when the tail (HR series) had to be cut, so it can
+  // say so instead of silently importing a short report. The marker is built
+  // at the very front of the arena, then the staged copy is shifted behind it.
+  if (off < len) {
+    char marker[32];
+    int marker_len = snprintf(marker, sizeof(marker), "|@TRUNC|%d|%d|", len, off);
+    if (marker_len > 0 && marker_len + off + 1 <= ARENA_SIZE) {
+      memmove(staged + marker_len, staged, (size_t)off + 1);
+      memcpy(s_sync_buf, marker, (size_t)marker_len);
+      proto_send("W", s_sync_buf);
+      s_proto_out_is_report = true;
+      return;
+    }
+    // Not enough room for the marker: send what survived, unprefixed.
+  }
+
   s_proto_out_is_report = true;
   proto_send("W", staged);
 }
 
-// Phone app connection came back: if a report is still staged (never ACKed),
-// push it now. Runs on the app's event loop, so the outbox is free.
+// Phone app connection came back: a staged (never ACKed) report is pushed
+// again, and the library state is re-announced so a phone that changed while
+// the watch was out of range is noticed immediately.
 static void on_pebblekit_connection(bool connected) {
   if (!connected) return;
   if (persist_exists(REPORT_STAGED_LEN_KEY)) report_retry_staged();
+  proto_send_hello();
 }
 
 // ---- outbox callbacks -------------------------------------------------- //
@@ -4221,9 +4363,8 @@ static void outbox_failed_callback(DictionaryIterator *iterator, AppMessageResul
 // ========================================================================= //
 // ------------------------------------------------------------------------- //
 // Apply ONE routine string to a slot. Returns true when the string parsed to  //
-// a named routine with at least one exercise (the same validity rule the      //
-// batch path uses). `merge_history` copies old actuals for exercises that     //
-// already existed in that slot.                                               //
+// a named routine with at least one exercise. `merge_history` copies old      //
+// actuals for exercises that already existed in that slot.                    //
 // ------------------------------------------------------------------------- //
 static bool apply_routine_to_slot(const char *routine_str, int slot_idx, bool merge_history) {
   if (!routine_str || slot_idx < 0 || slot_idx >= MAX_SLOTS) return false;
@@ -4263,160 +4404,154 @@ static int find_slot_by_name(const char *name) {
 }
 
 // ------------------------------------------------------------------------- //
-// 'R' — single routine, phone -> watch. Existing routines are updated in      //
-// place (history preserved); new ones take the next free slot.               //
+// 'T' — the routine library, phone -> watch. This is the ONLY way routine    //
+// definitions reach the watch, and it always carries EVERY routine, so       //
+// deletes, renames and reordering are implied by the payload itself and the  //
+// watch keeps no outbox, tombstone list or staging area for them.            //
+//                                                                            //
+// Body: "<seq>|<epoch>|<len>|<routine>|<routine>|…"                           //
 // ------------------------------------------------------------------------- //
-static void handle_routine_single(char *payload) {
-  int target_slot = find_slot_by_name(s_app.state.routine_name);
 
-  if (target_slot < 0) {
-    target_slot = s_app.storage.active_slots;
-    if (target_slot > MAX_SLOTS - 1) target_slot = MAX_SLOTS - 1;
-    if (!apply_routine_to_slot(payload, target_slot, false)) {
-      proto_fail_visible("Routine rejected.\nBad payload.");
-      return;
-    }
-  } else if (!apply_routine_to_slot(payload, target_slot, true)) {
-    proto_fail_visible("Routine rejected.\nBad payload.");
+// One routine is a free-text name followed by up to MAX_EXERCISES groups of six
+// fixed fields (name|sets|reps|weight|modifier|comment). That makes the routine
+// self-delimiting — the next routine starts exactly when the field balance is
+// Apply one routine segment (`len` chars, not NUL terminated separately) to
+// `slot_idx`. Returns false when the segment does not parse to a named routine
+// with at least one exercise.
+static bool library_apply_segment(const char *seg, int len, int slot_idx) {
+  // The library is already in persist at this point, so the arena (and with it
+  // the reassembled body) is free to be reused for the single routine copy.
+  static char *one = s_sync_buf;
+  if (len <= 0 || len >= ARENA_SIZE) return false;
+
+  memcpy(one, seg, len);
+  one[len] = '\0';
+
+  // A routine that is still present keeps the actuals recorded against it; a
+  // brand-new routine starts clean.
+  bool merge = (slot_idx < s_app.storage.active_slots);
+  return apply_routine_to_slot(one, slot_idx, merge);
+}
+
+// 'T' body as produced by pkjs:
+//   "T|<seq>|<epoch>|<len>|<n>|<routine>|<n>|<routine>|..."
+// `len` is the character count of everything after it (so a transfer that lost
+// a chunk for good is refused), and every routine is preceded by its exercise
+// count, which makes the boundaries exact. Applies the whole library or
+// nothing at all.
+static void handle_library_sync(char *body) {
+  // ---- header: marker, seq, epoch, declared length -----------------------
+  if (body[0] != 'T' || body[1] != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
+
+  char *p = body + 2;
+  uint32_t seq   = (uint32_t)strtoul(p, &p, 10);
+  if (*p != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
+  uint32_t epoch = (uint32_t)strtoul(p + 1, &p, 10);
+  if (*p != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
+  unsigned long declared = strtoul(p + 1, &p, 10);
+  if (*p != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
+  char *lib = p + 1;
+
+  if ((unsigned long)strlen(lib) != declared) {
+    proto_fail_visible("Routine sync rejected.\nTruncated.");
     return;
   }
 
-  refresh_directory();
-  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
-}
-
-// ------------------------------------------------------------------------- //
-// Batch, phone -> watch, sent as 'M' (open) -> 'R' per routine -> 'Z' (commit).
-//
-// Nothing in the live library is touched until 'Z' arrives, which gives us
-// validate-then-commit. Staged members live in PERSIST storage rather than RAM:
-// a 7-routine batch is ~9 KB and flint (Pebble 2 Duo, 64 KB RAM) cannot spare
-// that as static .bss — an in-RAM staging area overflowed the APP region by
-// 3 KB. Each staged routine is stored as a small header plus chunks, so the
-// whole batch costs zero RAM and survives a reboot mid-transfer.
-// ------------------------------------------------------------------------- //
-#define BATCH_STAGE_MAX   MAX_SLOTS
-#define BATCH_STAGE_CHUNK 256                       // persist record size
-#define BATCH_STAGE_SLOTS 6                         // 1536 / 256
-#define BATCH_STAGE_STRIDE (BATCH_STAGE_CHUNK * BATCH_STAGE_SLOTS)
-// Must not overlap ROUTINE_EX_BASE (1000 + MAX_SLOTS*MAX_EXERCISES = 1105),
-// the *_MIGRATION_KEY / report-staging block at 940-947, or ACTIVE_EX_BASE (400).
-#define BATCH_STAGE_KEY_BASE 1200
-#define BATCH_STAGE_COUNT_KEY 1210
-#define BATCH_STAGE_OPEN_KEY  1211
-
-static int  s_batch_stage_count = 0;
-static bool s_batch_open = false;
-
-static void batch_clear_storage(void) {
-  for (int i = 0; i < BATCH_STAGE_MAX; i++)
-    for (int c = 0; c < BATCH_STAGE_SLOTS; c++)
-      persist_delete(BATCH_STAGE_KEY_BASE + (i * BATCH_STAGE_STRIDE) + c);
-  persist_delete(BATCH_STAGE_COUNT_KEY);
-  persist_delete(BATCH_STAGE_OPEN_KEY);
-}
-
-static void batch_begin(void) {
-  batch_clear_storage();
-  s_batch_open = true;
-  s_batch_stage_count = 0;
-}
-
-static void batch_abort(void) {
-  s_batch_open = false;
-  s_batch_stage_count = 0;
-  batch_clear_storage();
-  proto_fail_visible("Batch rejected.\nNothing changed.");
-  vibes_double_pulse();
-}
-
-// Stage one member into persist. Returns false if it is invalid or does not fit.
-static bool batch_add_member(const char *routine_str) {
-  if (s_batch_stage_count >= BATCH_STAGE_MAX) return false;
-
-  // Validate without persisting: a parse leaves the name empty on failure.
-  parse_routine_string(routine_str);
-  if (s_app.state.routine_name[0] == '\0' || s_app.state.total_exercises <= 0) {
-    s_app.state.routine_name[0] = '\0';
-    s_app.state.total_exercises = 0;
-    return false;
+  // ---- stale or duplicate transfer? ------------------------------------
+  // Sequence numbers strictly increase, so a retransmitted or out-of-order
+  // library is dropped instead of being applied twice.
+  if (seq != 0 && seq <= s_seq_phone) {
+    proto_fail_visible("Routine sync: already up to date.");
+    return;
   }
 
-  int len = (int)strlen(routine_str);
-  int max = BATCH_STAGE_STRIDE - 1;
-  if (len <= 0 || len > max) return false;   // refuse rather than truncate
-
-  int slot = s_batch_stage_count;
-  int off  = 0;
-  for (int c = 0; c < BATCH_STAGE_SLOTS; c++) {
-    int take = len - off;
-    if (take <= 0) break;
-    if (take > BATCH_STAGE_CHUNK) take = BATCH_STAGE_CHUNK;
-    persist_write_data(BATCH_STAGE_KEY_BASE + (slot * BATCH_STAGE_STRIDE) + c,
-                       routine_str + off, take);
-    off += take;
+  // ---- split into routines ---------------------------------------------
+  // Work on a copy at the tail of the arena: the front still holds the body we
+  // are parsing. The copy is NUL terminated per routine, so apply can hand each
+  // one to parse_routine_string() without touching its neighbours.
+  char *buf = s_sync_buf + PROTO_IN_BUF_SIZE;
+  size_t lib_len = strlen(lib);
+  if (lib_len + 1 > ARENA_SIZE - PROTO_IN_BUF_SIZE) {
+    proto_fail_visible("Routine sync rejected.\nToo large.");
+    return;
   }
+  memcpy(buf, lib, lib_len + 1);
 
-  s_batch_stage_count++;
-  persist_write_int(BATCH_STAGE_COUNT_KEY, s_batch_stage_count);
-  return true;
-}
+  char  name[MAX_SLOTS][32];
+  char *seg[MAX_SLOTS];
+  int   seg_len[MAX_SLOTS];
+  int   count = 0;
+  char *cursor = buf;
 
-// 'Z': every member validated, so commit. Only now is the old library cleared.
-static void batch_commit(void) {
-  if (!s_batch_open || s_batch_stage_count == 0) { batch_abort(); return; }
-
-  // Re-read each staged routine into the shared scratch buffer, one at a time.
-  static char member[EXPORT_BUF_SIZE];
-
-  for (int i = 0; i < MAX_SLOTS; i++) {
-    persist_delete(STORAGE_KEY_BASE + i);
-    for (int j = 0; j < MAX_EXERCISES; j++)
-      persist_delete(ROUTINE_EX_BASE + (i * MAX_EXERCISES) + j);
-    persist_delete(LAST_COMPLETED_KEY_BASE + i);
-  }
-  s_app.storage.active_slots = 0;
-
-  for (int i = 0; i < s_batch_stage_count && i < MAX_SLOTS; i++) {
-    int off = 0;
-    for (int c = 0; c < BATCH_STAGE_SLOTS && off < (int)sizeof(member) - 1; c++) {
-      int got = persist_read_data(BATCH_STAGE_KEY_BASE + (i * BATCH_STAGE_STRIDE) + c,
-                                  member + off, BATCH_STAGE_CHUNK);
-      if (got <= 0) break;
-      off += got;
-    }
-    member[off] = '\0';
-    apply_routine_to_slot(member, i, false);
-  }
-
-  s_batch_open = false;
-  s_batch_stage_count = 0;
-  batch_clear_storage();
-
-  vibes_double_pulse();
-  refresh_directory();
-  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
-}
-
-// ------------------------------------------------------------------------- //
-// 'S' — tombstone list, phone -> watch. The phone (source of truth) removed    //
-// these routines, so the watch drops them too. This is the ONLY deletion      //
-// that crosses the wire: a delete made ON the watch stays on the watch.       //
-// ------------------------------------------------------------------------- //
-static void handle_routine_tombstones(char *payload) {
-  char *cursor = payload;
-  char name[32];
-
+  // Pass 1: walk routine by routine. Each one is "<n>|<name>|<exercise>|…",
+  // so the walk is exact: read n, read the name, skip n groups of six fields.
+  // Nothing is written to storage yet, so a body that turns out to be malformed
+  // half way through leaves the existing library untouched.
   while (*cursor != '\0') {
-    char *sep = strchr(cursor, '|');
-    int len = sep ? (int)(sep - cursor) : (int)strlen(cursor);
-    if (len > (int)sizeof(name) - 1) len = (int)sizeof(name) - 1;
+    if (count >= MAX_SLOTS) { proto_fail_visible("Routine sync rejected.\nToo many routines."); return; }
 
-    memcpy(name, cursor, len);
-    name[len] = '\0';
+    // Exercise count for this routine.
+    char *q = NULL;
+    long ex = strtol(cursor, &q, 10);
+    if (!q || q == cursor || *q != '|' || ex < 1 || ex > MAX_EXERCISES) {
+      proto_fail_visible("Routine sync rejected.\nBad routine count.");
+      return;
+    }
+    char *name_at = q + 1;
 
-    int slot = find_slot_by_name(name);
-    if (slot >= 0) {
+    // The routine name, terminated by the first '|'.
+    char *p = name_at;
+    int n = 0;
+    while (*p && *p != '|') {
+      if (n < (int)sizeof(name[0]) - 1) name[count][n++] = *p;
+      p++;
+    }
+    name[count][n] = '\0';
+    if (*p != '|' || n == 0) { proto_fail_visible("Routine sync rejected.\nUnnamed routine."); return; }
+
+    // Skip n groups of six fields.
+    char *end = p;                       // the name's '|'
+    for (int f = 0; f < (int)ex * 6; f++) {
+      if (*end != '|') { proto_fail_visible("Routine sync rejected.\nBad routine."); return; }
+      end++;                             // over the delimiter
+      while (*end && *end != '|') end++; // then over the field
+    }
+
+    // The routine handed to the parser is "<name>|<exercises>" — the count is
+    // not part of it.
+    seg[count]     = name_at;
+    seg_len[count] = (int)(end - name_at);
+    count++;
+
+    if (*end == '\0') break;             // last routine
+    end++;                               // the '|' that starts the next count
+    if (*end == '\0') { proto_fail_visible("Routine sync rejected.\nBad routine."); return; }
+    cursor = end;
+  }
+
+  // ---- apply: existing routines in place, new ones in the first free slot --
+  for (int i = 0; i < count; i++) {
+    int slot = find_slot_by_name(name[i]);
+    if (slot < 0) {
+      slot = s_app.storage.active_slots;    // compacted, so this is the free one
+      if (slot >= MAX_SLOTS) { proto_fail_visible("Routine sync rejected.\nNo free slot."); return; }
+    }
+    if (!library_apply_segment(seg[i], seg_len[i], slot)) {
+      proto_fail_visible("Routine sync rejected.\nBad routine.");
+      refresh_directory();
+      if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+      return;
+    }
+    refresh_directory();   // keep slot_names/counts in step for the next one
+  }
+
+  // ---- break: drop everything the phone no longer has --------------------
+  for (int slot = s_app.storage.active_slots - 1; slot >= 0; slot--) {
+    bool keep = false;
+    for (int i = 0; i < count; i++) {
+      if (strcmp(s_app.storage.slot_names[slot], name[i]) == 0) { keep = true; break; }
+    }
+    if (!keep) {
       persist_delete(STORAGE_KEY_BASE + slot);
       persist_delete(GHOST_KEY_BASE + slot);
       persist_delete(LAST_COMPLETED_KEY_BASE + slot);
@@ -4424,33 +4559,29 @@ static void handle_routine_tombstones(char *payload) {
         persist_delete(ROUTINE_EX_BASE + (slot * MAX_EXERCISES) + j);
       refresh_directory();
     }
-
-    if (!sep) break;
-    cursor = sep + 1;
   }
 
+  // ---- commit the sequence numbers --------------------------------------
+  s_seq_phone = seq;
+  persist_write_int(SYNC_SEQ_PHONE_KEY, (int32_t)seq);
+  persist_write_int(SYNC_EPOCH_ACK_KEY, (int32_t)epoch);
+
+  refresh_directory();
   if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+
+  vibes_double_pulse();
+  proto_fail_visible("Routines synced.");
 }
 
 // ------------------------------------------------------------------------- //
-// Routing: hand a fully reassembled body to the handler for its type.         //
+// Routing: hand a fully reassembled body to the handler for its type. Only    //
+// two transfers exist: 'T' (library, phone -> watch) and 'W' (the phone's     //
+// acknowledgement of the report we sent). Anything else is ignored.           //
 // ------------------------------------------------------------------------- //
 static void proto_dispatch(char type, char *body) {
   switch (type) {
-    case 'R':
-      if (s_batch_open) {
-        // Member of an in-flight batch: validate now, commit on 'Z'.
-        if (!batch_add_member(body)) batch_abort();
-      } else {
-        handle_routine_single(body);
-      }
-      break;
-    case 'M': batch_begin();                    break;  // batch open
-    case 'Z': batch_commit();                   break;  // batch commit
-    case 'B': break;                            // legacy full-batch body, unused in v7
-    case 'S': handle_routine_tombstones(body);  break;
-    case 'W': report_clear_staged();            break;  // phone confirmed
-    case 'P': break;                            // watch -> phone only
+    case 'T': handle_library_sync(body); break;   // library, make before break
+    case 'W': report_clear_staged();     break;   // phone confirmed the report
     default:  break;
   }
 }
@@ -4495,8 +4626,18 @@ static bool proto_handle_envelope(const char *msg) {
   }
   proto_note_version((int)ver);
 
-  if (total < 1 || total > PROTO_MAX_CHUNKS) return false;
-  if (seq < 1 || seq > total) return false;
+  if (total < 1 || seq < 1 || seq > total) return false;
+  if (total > PROTO_MAX_CHUNKS) {
+    // More chunks than we can reassemble: this is not a transport failure, the
+    // library is genuinely too big for this watch. Say so and tell the phone
+    // (via HELLO's SYNC_FLAGS) to stop resending and warn the user instead.
+    char why[32];
+    snprintf(why, sizeof(why), "Routines too big (%ld/%d)", total, PROTO_MAX_CHUNKS);
+    proto_fail_visible(why);
+    s_sync_failed = true;
+    proto_send_health();
+    return false;
+  }
 
   // New transfer? Reset the reassembly buffer.
   if (seq == 1) {
@@ -4535,17 +4676,22 @@ static bool proto_handle_envelope(const char *msg) {
 }
 
 // ------------------------------------------------------------------------- //
-// Inbox entry point. Handles the v7 envelope first; falls back to the legacy  //
-// keys for one release so a v6 phone app still works against a v7 watch.      //
+// Inbox entry point. Four things can arrive from the phone, nothing else:     //
+//   PROTO_MESSAGE        a chunk of a 'T' library                             //
+//   PROTO_ACK            the phone has the report we sent                     //
+//   PROGRESSION_MODE /   two ints                                              //
+//   WEIGHT_INCREMENT                                                          //
+//   SYNC_SEQUENCE/EPOCH  the phone's view of what the watch holds (HELLO)      //
 // ------------------------------------------------------------------------- //
 static void inbox_received_callback(DictionaryIterator *iterator, void *context) {
 
-  // ---------- v7 envelope ----------
+  // ---------- v8 envelope ----------
   Tuple *proto_tuple = dict_find(iterator, MESSAGE_KEY_PROTO_MESSAGE);
   if (proto_tuple && proto_tuple->type == TUPLE_CSTRING) {
-    // Only ACK a chunk we actually accepted. An unparseable or out-of-sequence
-    // chunk is left unacknowledged so the phone retries it instead of assuming
-    // delivery and leaving a half-transferred routine behind.
+    // Every chunk we accept is ACKed immediately, including the ones that only
+    // fill the reassembly buffer: receipt is all the ACK has ever meant, and
+    // acknowledging per chunk is what lets the phone bound its outbox. Apply
+    // decisions are made locally on the completed body (see proto_dispatch).
     if (proto_handle_envelope(proto_tuple->value->cstring)) {
       proto_send_ack(s_proto_in_id);
     }
@@ -4556,7 +4702,8 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
   Tuple *ack_tuple = dict_find(iterator, MESSAGE_KEY_PROTO_ACK);
   if (ack_tuple && ack_tuple->type == TUPLE_CSTRING) {
     // The phone has the whole report: drop the staged copy so it is not
-    // resent on the next reconnect.
+    // resent on the next reconnect. The id is re-checked at the phone too,
+    // so an ACK for anything else is ignored.
     if (s_proto_out_is_report && strcmp(ack_tuple->value->cstring, s_proto_out_id) == 0) {
       report_clear_staged();
       s_proto_out_seq = 0;
@@ -4565,42 +4712,35 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     return;
   }
 
-  // ---------- Legacy keys (v6 phone app) ----------
-  Tuple *routine_data_tuple = dict_find(iterator, MESSAGE_KEY_ROUTINE_DATA);
-  if (routine_data_tuple && routine_data_tuple->type == TUPLE_CSTRING) {
-    static char inbox_copy[EXPORT_BUF_SIZE];
-    strncpy(inbox_copy, routine_data_tuple->value->cstring, sizeof(inbox_copy) - 1);
-    inbox_copy[sizeof(inbox_copy) - 1] = '\0';
+  // ---------- HELLO: the phone tells us what it thinks we have ----------
+  // "sequence" is the library sequence the phone believes we applied and
+  // "epoch" is the library generation it belongs to. If either disagrees with
+  // our persisted state, the library is out of date (fresh install, factory
+  // reset, first sync after an update), so the phone sends it again.
+  //
+  // This is the whole reconciliation mechanism: one message each way, no
+  // timers, no staging, and it is idempotent by construction.
+  Tuple *seq_tuple   = dict_find(iterator, MESSAGE_KEY_SYNC_SEQUENCE);
+  Tuple *epoch_tuple = dict_find(iterator, MESSAGE_KEY_SYNC_EPOCH);
+  if (seq_tuple || epoch_tuple) {
+    int32_t phone_seq   = seq_tuple   ? seq_tuple->value->int32 : 0;
+    int32_t phone_epoch = epoch_tuple ? epoch_tuple->value->int32 : 0;
 
-    if (strncmp(inbox_copy, "BATCH~", 6) == 0) {
-      // Legacy v6 batch: one message, `~`-separated. Staged member by member
-      // through the same validate-then-commit path as the v7 'M'/'R'/'Z' flow,
-      // so it can no longer wipe the library on a bad payload.
-      batch_begin();
-      char *cursor = inbox_copy + 6;
-      while (cursor && *cursor != '\0') {
-        char *sep = strchr(cursor, '~');
-        if (sep) *sep = '\0';
-        if (!batch_add_member(cursor)) { batch_abort(); break; }
-        if (!sep) break;
-        cursor = sep + 1;
-      }
-      if (s_batch_open) batch_commit();
-    } else {
-      // The legacy path cannot address a slot by name, so resolve it the way
-      // the old code did: parse first, then look the name up.
-      parse_routine_string(inbox_copy);
-      int target = find_slot_by_name(s_app.state.routine_name);
-      if (target < 0) {
-        target = s_app.storage.active_slots;
-        if (target > MAX_SLOTS - 1) target = MAX_SLOTS - 1;
-        apply_routine_to_slot(inbox_copy, target, false);
-      } else {
-        apply_routine_to_slot(inbox_copy, target, true);
-      }
-      refresh_directory();
-      if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+    // What we actually hold is persisted, so a reboot mid-sync is caught too.
+    int32_t have_seq   = persist_exists(SYNC_SEQ_PHONE_KEY)
+                         ? persist_read_int(SYNC_SEQ_PHONE_KEY) : 0;
+    int32_t have_epoch = persist_exists(SYNC_EPOCH_ACK_KEY)
+                         ? persist_read_int(SYNC_EPOCH_ACK_KEY) : 0;
+
+    if (epoch_tuple && (phone_epoch != have_epoch || phone_seq != have_seq)) {
+      proto_fail_visible("Syncing routines...");
     }
+
+    // Always reply with what we hold, so the phone can see the mismatch for
+    // itself and send the library. The reply quotes persisted state, not the
+    // message we just received, so it can never bounce back and forth.
+    proto_send_hello();
+    return;
   }
 
   // ---------- Progression settings ----------
@@ -4631,6 +4771,14 @@ static void init(void) {
     persist_write_bool(V5_MIGRATION_KEY, true);
   }
 
+  // v8: load the sync bookkeeping. A watch that has never synced reports
+  // (0, 0), which no phone library can claim, so the first contact always
+  // pulls the library — with no separate "first run" code path.
+  s_seq_phone = persist_exists(SYNC_SEQ_PHONE_KEY) ? (uint32_t)persist_read_int(SYNC_SEQ_PHONE_KEY) : 0;
+
+  // v6/v7 leftovers: the batch staging area (keys 1200-1211) is gone in v8.
+  for (int i = 0; i < 12; i++) persist_delete(1200 + i);
+
   if (persist_exists(ACTIVE_STATE_KEY)) s_app.state.has_resume = true;
 
   s_app.ui.main_window = window_create();
@@ -4645,9 +4793,9 @@ static void init(void) {
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_outbox_sent(outbox_sent_callback);
   app_message_register_outbox_failed(outbox_failed_callback);
-  // 2048 inbox: chunked routine payloads arrive one chunk per message, and the
-  // reassembly buffer (s_proto_in_buf) is a separate static. 2048 outbox: the
-  // workout report carries per-set HR + the HR time-series, one chunk at a time.
+  // 2048 inbox: library chunks arrive one at a time, and the reassembly buffer
+  // (s_proto_in_buf) is a separate static. 2048 outbox: the workout report
+  // carries per-set HR + the HR time-series, one chunk at a time.
   app_message_open(2048, 2048);
 
   // v7.0.0: if a report was staged but never acknowledged (phone out of range
@@ -4661,6 +4809,10 @@ static void init(void) {
   if (persist_exists(REPORT_STAGED_LEN_KEY)) {
     report_retry_staged();
   }
+
+  // Announce the library state on boot. If the phone has a newer library (the
+  // user edited routines while the watch was off) it answers by sending it.
+  proto_send_hello();
 }
 
 static void deinit(void) {

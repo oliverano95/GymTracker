@@ -16,7 +16,10 @@
             "PROGRESSION_MODE",
             "WEIGHT_INCREMENT",
             "PROTO_MESSAGE",
-            "PROTO_ACK"
+            "PROTO_ACK",
+            "SYNC_SEQUENCE",
+            "SYNC_EPOCH",
+            "SYNC_FLAGS"
         ],
         "projectType": "native",
         "resources": {
@@ -44,5 +47,5 @@
             "watchface": false
         }
     },
-    "version": "7.0.1"
+    "version": "7.0.2"
 }

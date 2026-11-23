@@ -52,13 +52,6 @@
         .secondary-btn:hover { background: var(--grey-dark); }
         .delete-btn { background: var(--red); }
         .delete-btn:hover { background: var(--red-dark); }
-        .batch-btn {
-            background: var(--teal); padding: 12px; font-size: 16px;
-            margin-bottom: 10px; box-shadow: 0 2px 4px rgba(0,0,0,.1);
-            width: 100%; color: white; border: none;
-            border-radius: var(--radius); font-weight: bold; cursor: pointer;
-        }
-        .batch-btn:hover { background: var(--teal-dark); }
         .small-btn { width: auto; padding: 6px 10px; margin: 0; font-size: 12px; }
 
         /* ── Exercise list ── */
@@ -92,6 +85,7 @@
         .badge-bodyweight { background: var(--green); }
         .badge-bw-drop    { background: #6f42c1; }
         .badge-timed      { background: #fd7e14; }
+        .badge-countdown  { background: #fd7e14; opacity: .8; }
 
         /* ── Superset styling ── */
         .superset-link { border-left: 4px solid var(--blue); background: #f4f9ff; }
@@ -145,7 +139,6 @@
 <div class="tab-container">
     <button class="tab-btn active" onclick="switchTab(event,'tab-builder')">🏋️ Builder</button>
     <button class="tab-btn"        onclick="switchTab(event,'tab-progression')">📈 Progress</button>
-    <button class="tab-btn"        onclick="switchTab(event,'tab-batch')">📦 Batch</button>
     <button class="tab-btn"        onclick="switchTab(event,'tab-history-cloud')">☁️ History</button>
 </div>
 
@@ -184,6 +177,7 @@
             <option value="2">Superset</option>
             <option value="3">Warmup</option>
             <option value="6">Timed (Count up)</option>
+            <option value="8">Timed (Count down)</option>
             <option value="7">Giant Set</option>
         </select>
         <div id="modifierDesc" class="modifier-desc">Standard exercise execution with regular rest periods.</div>
@@ -245,32 +239,6 @@
     </div>
 </div>
 
-<!-- ════════════ TAB: BATCH ════════════ -->
-<div id="tab-batch" class="tab-content">
-    <div class="card">
-        <h3 style="margin-top:0;">Batch Routine Queue</h3>
-        <p style="font-size:12px; color:gray; margin-top:0;">Prepare multiple routines and send an entire week to the watch at once.</p>
-        <div style="background:#fafafa; border:1px solid #ddd; border-radius:4px; margin-bottom:15px; padding:10px;">
-            <h4 id="batchCount" style="margin-top:0; text-align:center; color:var(--teal);">0 / 7 Routines Prepared</h4>
-            <div id="batchList">
-                <p style="color:gray; font-size:12px; text-align:center;">No routines in the batch yet.</p>
-            </div>
-        </div>
-        <button onclick="sendBatchToPebble()" style="padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2);">🚀 Send Entire Batch to Watch</button>
-    </div>
-
-    <div class="card">
-        <h3 style="margin-top:0;">Import / Export via Text</h3>
-        <p style="font-size:12px; color:gray; margin-top:0;">Use this to back up a routine or transfer it from another device. Generate the text on one device, copy it, then paste and import on another.</p>
-        <textarea id="routineTextArea" rows="3" style="font-family:monospace; font-size:11px; resize:vertical;" placeholder='{"n":"My Routine","e":[]}'></textarea>
-        <div class="flex-row">
-            <button type="button" class="small-btn secondary-btn" style="margin:0; flex:1;" onclick="exportToText()">1. Gen Text</button>
-            <button type="button" class="small-btn secondary-btn" style="margin:0; flex:1;" onclick="copyText()">2. Copy</button>
-            <button type="button" class="small-btn" style="margin:0; flex:1; background:var(--green);" onclick="importFromText()">⬇️ Import</button>
-        </div>
-    </div>
-</div>
-
 <!-- ════════════ TAB: HISTORY / CLOUD ════════════ -->
 <div id="tab-history-cloud" class="tab-content">
     <div class="card">
@@ -307,13 +275,24 @@
         <input type="text"     id="googleUrlInput" placeholder="https://script.google.com/macros/s/.../exec">
         <label>Export Password:</label>
         <input type="password" id="googlePwdInput" placeholder="Your secret password">
+        <button type="button" onclick="exportRoutinesToCSV()" style="width:100%; padding:12px; margin-top:12px; background:var(--green); color:white; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer;">Export Routines to CSV</button>
+    </div>
+
+    <div class="card">
+        <h3 style="margin-top:0;">Import / Export via Text</h3>
+        <p style="font-size:12px; color:gray; margin-top:0;">Use this to back up a routine or transfer it from another device. Generate the text on one device, copy it, then paste and import on another.</p>
+        <textarea id="routineTextArea" rows="3" style="font-family:monospace; font-size:11px; resize:vertical;" placeholder='{"n":"My Routine","e":[]}'></textarea>
+        <div class="flex-row">
+            <button type="button" class="small-btn secondary-btn" style="margin:0; flex:1;" onclick="exportToText()">1. Gen Text</button>
+            <button type="button" class="small-btn secondary-btn" style="margin:0; flex:1;" onclick="copyText()">2. Copy</button>
+            <button type="button" class="small-btn" style="margin:0; flex:1; background:var(--green);" onclick="importFromText()">⬇️ Import</button>
+        </div>
     </div>
 </div>
 
 <!-- ════════════ GLOBAL ACTION BUTTONS ════════════ -->
 <div id="global-actions" style="margin-bottom:40px;">
-    <button id="btn-add-batch"    class="batch-btn" onclick="addToBatch()">📦 + Add Current Routine to Batch</button>
-    <button id="btn-send-single"  style="padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2);" onclick="saveAndSendSingle()">Save &amp; Send Single Routine to Watch</button>
+    <button id="btn-send-single"  style="padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2);" onclick="saveAndSendSingle()">Save &amp; Send to Watch</button>
     <button id="btn-send-google"  style="display:none; padding:15px; font-size:18px; width:100%; box-shadow:0 4px 6px rgba(0,0,0,.2); background:var(--green);" onclick="saveAndSendSingle()">☁️ Save Google Settings to Watch</button>
 </div>
 
@@ -329,15 +308,17 @@ const MAX_EXERCISES   = 15;    // mirrors #define MAX_EXERCISES in main.c
 const MAX_SETS        = 10;    // mirrors the 10-entry actual_reps/actual_weight arrays in main.c
 const MAX_HISTORY     = 30;
 
-// Hard cap on the ENCODED config response (the pebblejs://close# payload).
-// The phone app silently drops responses above a platform limit, so a too-long
-// routine appeared to "save" while the watch never received it. Measurements
-// from a real device: 252 and 279 encoded chars delivered fine, 672 was
-// silently dropped — the true limit sits between them (suspected 512, to be
-// confirmed via the pkjs webviewclosed length log). The cap is conservative;
-// note encodeURIComponent inflates pipes/spaces/commas ~2.1x, so the routine
-// string itself must stay well under ~200 raw chars.
+// The pebblejs://close# response is still the transport out of the webview, so
+// it must stay small. It no longer carries routines at all: the page writes
+// them to localStorage (which the phone app reads from its own storage, since
+// the two do not share one) and only reports "the library changed" here.
+// Measured on a real device: 252 and 279 encoded chars deliver, 672 does not,
+// so this cap keeps the response in the range that is known to work.
 const MAX_CONFIG_RESPONSE = 450;
+
+// Settings blobs that legitimately exceed the cap (large workout history) are
+// trimmed rather than blocked — see buildConfigPayload.
+const MAX_HISTORY_IN_PAYLOAD = 5;
 
 /** Modifier value → { label, badgeClass } */
 const MODIFIER_META = {
@@ -346,6 +327,7 @@ const MODIFIER_META = {
     2: { desc: '<strong>Superset:</strong> Links this exercise with the <strong>NEXT</strong> exercise. The watch bounces between the two until all sets are done.', borderColor: '#007bff' },
     3: { desc: '<strong>Warmup:</strong> Executes normally but the watch cuts the rest timer in half between sets.', borderColor: '#ffc107' },
     6: { desc: '<strong>Timed Exercise:</strong> "Target Reps" = Target Seconds. Press Select to start the timer. Target Weight is ignored.', borderColor: '#fd7e14' },
+    8: { desc: '<strong>Timed Exercise (Count down):</strong> "Target Reps" = Target Seconds. Press Select to start, then the watch counts down the time left and double-buzzes at zero. Past zero it counts the overtime up with a "+". The set is logged as the total time held. Target Weight is ignored.', borderColor: '#fd7e14' },
     7: { desc: '<strong>Giant Set:</strong> Links this exercise with the <strong>NEXT TWO</strong> exercises. The watch bounces across all three until all sets are done. All three must have the same target sets.', borderColor: '#6f42c1' }
 };
 
@@ -371,7 +353,6 @@ const EXERCISE_DB = {
 // STATE
 // ============================================================
 let myRoutine        = [];
-let batchRoutines    = [];
 let editingIndex     = -1;
 let draggedIndex     = null;
 let workoutHistory   = [];
@@ -424,7 +405,6 @@ function switchTab(evt, tabId) {
 
     const showGlobal   = tabId === 'tab-builder' || tabId === 'tab-progression';
     const showGoogle   = tabId === 'tab-history-cloud';
-    document.getElementById('btn-add-batch').style.display   = showGlobal  ? 'block' : 'none';
     document.getElementById('btn-send-single').style.display = showGlobal  ? 'block' : 'none';
     document.getElementById('btn-send-google').style.display = showGoogle  ? 'block' : 'none';
 }
@@ -434,14 +414,31 @@ function switchTab(evt, tabId) {
 // ============================================================
 function getSavedRoutines()  { return Storage.getJSON('savedRoutines', []); }
 function getLastRoutine()    { return Storage.get('lastRoutine', ''); }
-function saveRoutineToStorage(name, exercises, progressionMode, weightIncrement) {
+
+// `renameFrom` is set only by the save-and-send path when the editor's name no
+// longer matches the routine it was loaded from. Bulk callers (seeding) pass
+// nothing, so they can never remove a routine by accident.
+function saveRoutineToStorage(name, exercises, progressionMode, weightIncrement, renameFrom) {
     let routines = getSavedRoutines();
     const idx = routines.findIndex(r => r.name === name);
     const data = { name, exercises: exercises.map(migrateLegacyExercise), progressionMode, weightIncrement };
     if (idx >= 0) routines[idx] = data; else routines.push(data);
+
+    // A rename is a delete of the old name plus a create of the new one: drop
+    // the old entry so the library no longer contains it. Deletion needs no
+    // separate bookkeeping — the phone sends the whole library and the watch
+    // removes whatever is absent.
+    if (renameFrom && renameFrom !== name) {
+        routines = routines.filter(r => r.name !== renameFrom);
+    }
+
     Storage.setJSON('savedRoutines', routines);
     Storage.set('lastRoutine', name);
 }
+
+// The routine currently loaded in the editor, so a rename can be detected.
+// Set by selectRoutine() and by the seeding/import paths.
+let loadedRoutineName = '';
 
 // ============================================================
 // LEGACY MIGRATION
@@ -489,6 +486,7 @@ function selectRoutine() {
         document.getElementById('progressionMode').value = '-1';
         document.getElementById('weightIncrement').value = '2';
         myRoutine = [];
+        loadedRoutineName = '';   // nothing loaded: a later save must not look like a rename
         renderRoutine();
         updateProgressionUI();
         return;
@@ -500,6 +498,7 @@ function selectRoutine() {
     document.getElementById('progressionMode').value    = routine.progressionMode || '-1';
     document.getElementById('weightIncrement').value    = routine.weightIncrement || '2';
     myRoutine = (routine.exercises || []).map(migrateLegacyExercise);
+    loadedRoutineName = name;   // baseline for rename detection
     renderRoutine();
     updateProgressionUI();
     Storage.set('lastRoutine', name);
@@ -513,6 +512,11 @@ function deleteRoutine() {
     Storage.setJSON('savedRoutines', routines);
     if (getLastRoutine() === name) Storage.remove('lastRoutine');
 
+    // Drop the routine from the library, then push the library to the watch so
+    // the slot disappears there too. A delete made ON the watch is the opposite
+    // case: it stays local and the routine reappears on the next phone send.
+    loadedRoutineName = '';
+
     document.getElementById('routineName').value     = '';
     document.getElementById('progressionMode').value = '-1';
     document.getElementById('weightIncrement').value = '2';
@@ -520,6 +524,7 @@ function deleteRoutine() {
     renderRoutine();
     updateProgressionUI();
     loadSavedRoutines();
+    sendRoutineToPebble();
 }
 
 // ============================================================
@@ -541,8 +546,9 @@ function updateModifierDesc() {
     desc.innerHTML             = meta.desc;
     desc.style.borderLeftColor = meta.borderColor;
 
-    // UX: adapt form field labels and placeholders to the selected modifier
-    const isTimed    = val === '6';
+    // UX: adapt form field labels and placeholders to the selected modifier.
+    // Timed exercises exist in both directions: 6 counts up, 8 counts down.
+    const isTimed    = val === '6' || val === '8';
     const repsInput  = document.getElementById('targetReps');
     const repsLabel  = document.getElementById('labelTargetReps');
     const weightInput  = document.getElementById('targetWeight');
@@ -661,7 +667,8 @@ function renderRoutine() {
         if (isGiantThirdHalf)      badges += '<span class="mod-badge badge-giant-3">GIANT 3/3</span> ';
         if (modifier === 3)        badges += '<span class="mod-badge badge-warmup">WARMUP</span> ';
         if (modifier === 6)        badges += '<span class="mod-badge badge-timed">TIMED</span> ';
-        if (modifier !== 6 && weight === 0) {
+        if (modifier === 8)        badges += '<span class="mod-badge badge-countdown">COUNTDOWN</span> ';
+        if (modifier !== 6 && modifier !== 8 && weight === 0) {
             badges += modifier === 1
                 ? '<span class="mod-badge badge-bw-drop">BW DROP</span> '
                 : '<span class="mod-badge badge-bodyweight">BODYWEIGHT</span> ';
@@ -695,7 +702,7 @@ function renderRoutine() {
                 ${handle}
                 <div class="exercise-details">
                     <div style="line-height:1.2;margin-bottom:4px;"><strong>${ex[0]}</strong> ${badges}</div>
-                    <div>${ex[1]}s × ${modifier === 6 ? ex[2] + 'sec' : ex[2] + 'r'} @ ${weight === 0 ? (modifier === 6 ? '—' : 'BW') : weight + 'kg'}</div>
+                    <div>${ex[1]}s × ${(modifier === 6 || modifier === 8) ? ex[2] + 'sec' : ex[2] + 'r'} @ ${weight === 0 ? ((modifier === 6 || modifier === 8) ? '—' : 'BW') : weight + 'kg'}</div>
                     ${comment}
                 </div>
             </div>
@@ -750,7 +757,7 @@ function addExercise() {
     const reps     = document.getElementById('targetReps').value;
     const weight   = document.getElementById('targetWeight').value;
     const modifier = parseInt(document.getElementById('exerciseModifier').value, 10);
-    const isTimed  = modifier === 6;
+    const isTimed  = modifier === 6 || modifier === 8;
 
     if (sets === '' || reps === '') {
         alert(isTimed
@@ -1007,7 +1014,7 @@ function applyLinkedSetCascade(routine, editIndex) {
 }
 
 // ============================================================
-// ROUTINE SERIALISATION  (shared by single send and batch)
+// ROUTINE SERIALISATION
 // ============================================================
 function validateRoutineForSend(name) {
     if (myRoutine.length === 0) return true; // allow sending settings-only
@@ -1025,20 +1032,21 @@ function serialiseRoutine(name, exercises) {
 }
 
 // ============================================================
-// BUILD CONFIG PAYLOAD  (shared by single send and batch)
+// CONFIG RESPONSE
 // ============================================================
-function buildConfigPayload(routineData) {
-    // Only include fields that are actually set. The response rides the
-    // pebblejs://close# URL, which the phone app silently truncates past a
-    // platform limit, so every unnecessary character shrinks how much
-    // routine data can be delivered. Google creds are persisted phone-side
-    // in webviewclosed (index.js) regardless, so empty/unset values are
-    // simply omitted here.
+// The response out of the webview carries only small control flags. Routines
+// never travel through it: the page owns `savedRoutines` in localStorage, and
+// the phone app reads that library out of its own storage when it sees
+// `libraryChanged`. Nothing is parked for the phone to pick up, because the
+// webview and the phone app do not share storage — that is precisely why the
+// old 'pendingRoutine' hand-off silently did nothing.
+function buildConfigPayload() {
+    // Only include fields that are actually set: unset ones cost URL headroom
+    // and the phone app keeps the previous value when a field is absent.
     const payload = {
         progressionMode: document.getElementById('progressionMode').value,
         weightIncrement: document.getElementById('weightIncrement').value
     };
-    if (routineData) payload.routineData = routineData;
     const googleUrl = document.getElementById('googleUrlInput').value;
     const googlePwd  = document.getElementById('googlePwdInput').value;
     if (googleUrl) payload.googleUrl = googleUrl;
@@ -1048,11 +1056,31 @@ function buildConfigPayload(routineData) {
     return payload;
 }
 
+// Save the editor's routine into the stored library, then close the webview
+// with "the library changed" so the phone app pushes the whole library.
+function sendRoutineToPebble() {
+    const payload = buildConfigPayload();
+    payload.libraryChanged = true;
+    sendToPebble(payload);
+}
+
 function sendToPebble(configData) {
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
-    const encoded  = encodeURIComponent(JSON.stringify(configData));
+
+    // If the blob is still too long it is the history that is oversized; drop
+    // the oldest entries instead of refusing to save.
+    let guard = 0;
+    let encoded = encodeURIComponent(JSON.stringify(configData));
+
+    while (encoded.length > MAX_CONFIG_RESPONSE && guard < MAX_HISTORY && configData.history) {
+        configData.history.shift();
+        if (configData.history.length === 0) delete configData.history;
+        encoded = encodeURIComponent(JSON.stringify(configData));
+        guard++;
+    }
+
     if (encoded.length > MAX_CONFIG_RESPONSE) {
-        alert(`⚠️ Settings payload is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer (longer responses are silently dropped and never reach the watch). Please shorten exercise names/comments or split the routine.`);
+        alert(`⚠️ Settings are ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer. This is usually a very long Google Sheets URL; please shorten it.`);
         return;
     }
     window.location.href = returnTo + encoded;
@@ -1090,121 +1118,119 @@ function parseSyncString(syncStr) {
     return { name: parts[0], exercises, progressionMode, weightIncrement };
 }
 
-// True when the editor's routine exactly matches the last copy the watch
-// synced to the phone. If so, only the progression settings need sending
-// (a tiny, always-deliverable payload) instead of the full routine.
-function routineMatchesSyncedCopy(name) {
-    const syncStr = syncedRoutinesDict[name];
-    if (!syncStr) return false;
+// ============================================================
+// MANUAL ROUTINE EXPORT  (CSV backup)
+// ============================================================
+function getAllRoutineDefinitions() {
+    const routines = getSavedRoutines();
+    const definitions = {};
 
-    const parsed = parseSyncString(syncStr);
-    if (!parsed) return false;
-    const syncExercises = parsed.exercises;
+    // Every routine currently in savedRoutines is exported: that list IS the
+    // library the watch is given, so the CSV is a faithful backup of it.
+    routines.forEach(r => {
+        const parts = [r.name, r.progressionMode || '-1', r.weightIncrement || '2'];
+        (r.exercises || []).forEach(ex => {
+            parts.push(ex.map(v => v === undefined || v === null ? '' : v).join(':'));
+        });
+        definitions[r.name] = parts.join('|');
+    });
 
-    if (syncExercises.length !== myRoutine.length) return false;
-    for (let i = 0; i < myRoutine.length; i++) {
-        const a = myRoutine[i];
-        const b = syncExercises[i];
-        if (String(a[0]) !== String(b[0])) return false;
-        if (Number(a[1]) !== Number(b[1])) return false;
-        if (Number(a[2]) !== Number(b[2])) return false;
-        if (Number(a[3]) !== Number(b[3])) return false;
-        if ((a.length > 4 ? Number(a[4]) : 0) !== Number(b[4])) return false;
-        if ((a.length > 5 ? String(a[5]) : '') !== String(b[5] || '')) return false;
+    return definitions;
+}
+
+function exportRoutinesToCSV() {
+    // Reuse the already-configured Google endpoint: typed value → URL query
+    // param (pkjs injects googleUrl/googlePwd on every config-page open) →
+    // localStorage. Matches the workout-export fallback so users aren't asked
+    // to re-enter an endpoint they've already configured.
+    const googleUrl = document.getElementById('googleUrlInput').value.trim()
+                   || getQueryParam('googleUrl', '').trim()
+                   || Storage.get('googleUrl', '');
+    const googlePwd = document.getElementById('googlePwdInput').value.trim()
+                   || getQueryParam('googlePwd', '').trim()
+                   || Storage.get('googlePwd', '');
+
+    if (!googleUrl || !googleUrl.trim()) {
+        alert('Please enter a Google Script URL first.');
+        return;
     }
-    return true;
+    if (!googlePwd || !googlePwd.trim()) {
+        alert('Please enter an export password first.');
+        return;
+    }
+
+    const definitions = getAllRoutineDefinitions();
+    if (Object.keys(definitions).length === 0) {
+        alert('No routines to export.');
+        return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', googleUrl, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            alert('Routines exported successfully!');
+        } else {
+            alert('Export failed: ' + xhr.status);
+        }
+    };
+    xhr.onerror = function() {
+        alert('Network error. Check the URL.');
+    };
+    xhr.send(JSON.stringify({
+        token: googlePwd,
+        routineDefinitions: definitions
+    }));
 }
 
 // ============================================================
-// SINGLE SEND
+// SAVE & SEND
 // ============================================================
+// One button, one meaning: put the editor's routine in the library and push
+// the library to the watch. There is no "single routine" versus "batch"
+// distinction any more, so there is nothing here to choose between.
 function saveAndSendSingle() {
     const name = document.getElementById('routineName').value || 'My Routine';
     if (!validateRoutineForSend(name)) return;
 
-    if (myRoutine.length === 0 && !shouldClearHistory && !shouldClearGoogle
+    const settingsOnly = (myRoutine.length === 0);
+
+    if (settingsOnly && !shouldClearHistory && !shouldClearGoogle
         && !document.getElementById('googleUrlInput').value
         && !document.getElementById('googlePwdInput').value) {
         alert('Please add at least one exercise or configure settings.');
         return;
     }
 
-    // If the routine is unchanged from the watch's last synced copy, send
-    // only the progression settings (tiny payload, always fits the transfer
-    // limit). Only re-transmit the full routine when it actually changed.
-    let routineStr = '';
-    if (myRoutine.length > 0 && !routineMatchesSyncedCopy(name)) {
-        routineStr = serialiseRoutine(name, myRoutine);
+    if (!settingsOnly) {
+        const routineStr = serialiseRoutine(name, myRoutine);
         if (routineStr.length > MAX_ROUTINE_LEN) {
             alert('⚠️ Routine too long! Please abbreviate some exercise names and try again.');
             return;
         }
+
+        // Detect a rename: the editor holds a routine loaded under a different
+        // name, so the old entry has to leave the library (issue #46). The old
+        // name used to be tombstoned for the watch; now it is simply absent
+        // from the library that gets sent.
+        const renameFrom = (loadedRoutineName && loadedRoutineName !== name) ? loadedRoutineName : null;
+
+        saveRoutineToStorage(name, myRoutine,
+            document.getElementById('progressionMode').value,
+            document.getElementById('weightIncrement').value,
+            renameFrom);
+        loadedRoutineName = name;   // the new name is the baseline from now on
+        loadSavedRoutines();
     }
 
-    saveRoutineToStorage(name, myRoutine,
-        document.getElementById('progressionMode').value,
-        document.getElementById('weightIncrement').value);
-    loadSavedRoutines();
-    sendToPebble(buildConfigPayload(routineStr));
-}
-
-// ============================================================
-// BATCH
-// ============================================================
-function addToBatch() {
-    if (batchRoutines.length >= MAX_BATCH) {
-        alert(`Batch is full! Max ${MAX_BATCH} routines.`); return;
+    // Settings-only saves (Google credentials, history) do not touch routines,
+    // so they close the webview without asking the watch for a library push.
+    if (settingsOnly) {
+        sendToPebble(buildConfigPayload());
+    } else {
+        sendRoutineToPebble();
     }
-    if (myRoutine.length === 0) {
-        alert('Please add at least one exercise before adding to the batch.'); return;
-    }
-    const name = document.getElementById('routineName').value || `Routine ${batchRoutines.length + 1}`;
-    if (!validateRoutineForSend(name)) return;
-
-    const dataStr = serialiseRoutine(name, myRoutine);
-    if (dataStr.length > MAX_ROUTINE_LEN) {
-        alert(`⚠️ Routine '${name}' too long! Please abbreviate some exercise names.`); return;
-    }
-
-    batchRoutines.push({ name, dataStr });
-    saveRoutineToStorage(name, myRoutine,
-        document.getElementById('progressionMode').value,
-        document.getElementById('weightIncrement').value);
-    loadSavedRoutines();
-
-    myRoutine = [];
-    document.getElementById('routineName').value = '';
-    renderRoutine();
-    renderBatchUI();
-    alert(`✅ '${name}' added to batch! (${batchRoutines.length}/${MAX_BATCH})`);
-}
-
-function renderBatchUI() {
-    document.getElementById('batchCount').innerText = `${batchRoutines.length} / ${MAX_BATCH} Routines Prepared`;
-    const listDiv = document.getElementById('batchList');
-    if (batchRoutines.length === 0) {
-        listDiv.innerHTML = '<p style="color:gray;font-size:12px;text-align:center;">No routines in the batch yet.</p>';
-        return;
-    }
-    const fragment = document.createDocumentFragment();
-    batchRoutines.forEach((r, i) => {
-        const div = document.createElement('div');
-        div.className = 'exercise-item';
-        div.innerHTML = `<strong>${r.name}</strong><button class="small-btn delete-btn" onclick="removeFromBatch(${i})">✕</button>`;
-        fragment.appendChild(div);
-    });
-    listDiv.innerHTML = '';
-    listDiv.appendChild(fragment);
-}
-
-function removeFromBatch(index) { batchRoutines.splice(index, 1); renderBatchUI(); }
-
-function sendBatchToPebble() {
-    if (batchRoutines.length === 0) {
-        alert('Your batch is empty! Add routines from the Builder first.'); return;
-    }
-    const finalStr = 'BATCH~' + batchRoutines.map(r => r.dataStr).join('~');
-    sendToPebble(buildConfigPayload(finalStr));
 }
 
 // ============================================================
@@ -1319,25 +1345,65 @@ function generateCSVBox() {
 
     const rows = ['Date,Routine,Duration (s),Mood,Accuracy (%),Density,Peak HR,Avg HR,Exercise,Set,Reps,Weight'];
     selected.forEach(entry => {
-        const parts    = entry.data.split('|');
+        const parts = entry.data.split('|');
+
+        // New format carries a reserved "@HR" time-series section and encodes
+        // each set as a 4-token tuple (reps, weight, set peak HR, set avg HR).
+        // Older workouts (no marker) used workout-wide Peak/Avg HR + 2-field sets.
+        const isNew = parts.includes('@HR');
+
         const routine  = parts[0] || 'Unknown';
         const date     = parts[1] || '';
         const duration = parts[2] || '0';
-        let mood = '', accuracy = '', density = '', peakHR = '', avgHR = '';
-        let startIndex = 3;
 
-        if (parts.length > 8 && !isNaN(parts[3])) {
-            [mood, accuracy, density, peakHR, avgHR] = [parts[3],parts[4],parts[5],parts[6],parts[7]];
+        let mood = '', accuracy = '', density = '';
+        let peakHR = '', avgHR = '';   // legacy fallback: workout-wide values
+        let startIndex;
+
+        if (isNew) {
+            [mood, accuracy, density] = [parts[3], parts[4], parts[5]];
+            startIndex = 6;
+        } else {
+            [mood, accuracy, density, peakHR, avgHR] = [parts[3], parts[4], parts[5], parts[6], parts[7]];
             startIndex = 8;
         }
 
         let currentExercise = '';
         let setNum = 1;
         for (let i = startIndex; i < parts.length; i++) {
-            if (isNaN(parts[i])) {
-                currentExercise = parts[i]; setNum = 1;
+            const token = parts[i];
+
+            if (token === '@HR') {
+                // Time-series lives in the next token: "sec,bpm;sec,bpm;...".
+                const series = parts[i + 1] || '';
+                if (series) {
+                    rows.push('');
+                    rows.push('HR Time Series');
+                    rows.push('Time (s),Heart Rate (BPM)');
+                    series.split(';').forEach(pair => {
+                        if (pair && pair.includes(',')) rows.push(pair);
+                    });
+                }
+                break;
+            }
+
+            if (token === '') { continue; }   // safety: skip stray empty tokens
+
+            if (isNaN(token)) {
+                currentExercise = token; setNum = 1;
+            } else if (isNew) {
+                // 4-token set: reps, weight, set peak HR, set avg HR
+                const reps    = token;
+                const weight  = parts[i + 1] !== undefined ? parts[i + 1] : '';
+                const setPeak = parts[i + 2] !== undefined ? parts[i + 2] : '';
+                const setAvg  = parts[i + 3] !== undefined ? parts[i + 3] : '';
+                rows.push(`${date},${routine},${duration},${mood},${accuracy},${density},${setPeak},${setAvg},${currentExercise},${setNum},${reps},${weight}`);
+                setNum++; i += 3;
             } else {
-                rows.push(`${date},${routine},${duration},${mood},${accuracy},${density},${peakHR},${avgHR},${currentExercise},${setNum},${parts[i]},${parts[i+1]}`);
+                // legacy 2-field set: reps, weight (Peak/Avg HR stay workout-wide)
+                const reps   = token;
+                const weight = parts[i + 1] !== undefined ? parts[i + 1] : '';
+                rows.push(`${date},${routine},${duration},${mood},${accuracy},${density},${peakHR},${avgHR},${currentExercise},${setNum},${reps},${weight}`);
                 setNum++; i++;
             }
         }
@@ -1452,7 +1518,6 @@ window.addEventListener('load', () => {
     loadSavedRoutines();
 
     // Show global action buttons (builder tab is default)
-    document.getElementById('btn-add-batch').style.display   = 'block';
     document.getElementById('btn-send-single').style.display = 'block';
     document.getElementById('btn-send-google').style.display = 'none';
 
@@ -1525,6 +1590,7 @@ window.addEventListener('load', () => {
                 updateProgressionUI();
             }
             myRoutine = syncExercises;
+            loadedRoutineName = activeName;   // baseline for rename detection
             renderRoutine();
             saveRoutineToStorage(
                 activeName,
@@ -1535,14 +1601,13 @@ window.addEventListener('load', () => {
             return;
         }
 
-        // Local copy exists: merge. Match each sync exercise against the
-        // local copy using stable identity fields only (name, sets,
-        // modifier, comment). Reps and weight are progression values the
-        // watch may auto-update, so they are excluded from the identity
-        // check and merged from the sync when they differ. This preserves
-        // renames, reorderings, deletions, and comment edits made on the
-        // phone, while still picking up the watch's auto-progression for
-        // both reps and weight.
+        // Local copy exists: overlay ONLY the progression values.
+        // v7.0.0: the phone is the single source of truth for routine
+        // definitions, so the watch can no longer add, rename, reorder or
+        // remove exercises. The only thing it still reports is auto-progression
+        // of target reps/weight, which is merged here by exercise identity
+        // (name, sets, modifier, comment). Anything extra the watch reports is
+        // ignored — that eliminates the resurrection/duplication bugs (#46).
         let merged = false;
         const mergedExercises = (localRoutine.exercises || []).map(migrateLegacyExercise);
         for (let i = 0; i < syncExercises.length && i < mergedExercises.length; i++) {

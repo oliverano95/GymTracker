@@ -11,9 +11,12 @@ const ROOT = path.resolve(__dirname, '..');
 const BASE_URL = `file://${ROOT}/index_dev.html`;
 
 async function openConfig(page, syncDict) {
-  let url = `${BASE_URL}`;
+  // `return_to` keeps the page on a harmless URL: deleting a routine now closes
+  // the webview (the phone app is asked to re-sync), so navigation must not
+  // jump to the pebblejs:// scheme inside the test browser.
+  let url = `${BASE_URL}?return_to=${encodeURIComponent('about:blank#')}`;
   if (syncDict) {
-    url += `?sync=${encodeURIComponent(JSON.stringify(syncDict))}`;
+    url += `&sync=${encodeURIComponent(JSON.stringify(syncDict))}`;
   }
   await page.goto(url);
   await page.waitForFunction(() => typeof Storage !== 'undefined');
@@ -27,10 +30,9 @@ test.describe('Config page loads correctly', () => {
     await openConfig(page);
 
     const tabs = page.locator('.tab-btn');
-    await expect(tabs).toHaveCount(4);
+    await expect(tabs).toHaveCount(3);          // v8: the Batch tab is gone
 
     await expect(page.locator('#btn-send-single')).toBeVisible();
-    await expect(page.locator('#btn-add-batch')).toBeVisible();
     await expect(page.locator('#addUpdateBtn')).toBeVisible();
     await expect(page.locator('#routineName')).toBeVisible();
     await expect(page.locator('#exerciseSelect')).toBeVisible();
@@ -44,16 +46,16 @@ test.describe('Config page loads correctly', () => {
 // 2. TAB SWITCHING — clicking a tab changes visible content
 // ============================================================
 test.describe('Tab switching', () => {
-  test('clicking Batch tab hides builder buttons, shows batch area', async ({ page }) => {
+  test('clicking the History tab hides the builder buttons', async ({ page }) => {
     await openConfig(page);
 
     await expect(page.locator('#tab-builder')).toHaveClass(/active/);
     await expect(page.locator('#btn-send-single')).toBeVisible();
 
-    await page.click('button:has-text("Batch")');
+    await page.click('button:has-text("History")');
 
     await expect(page.locator('#tab-builder')).not.toHaveClass(/active/);
-    await expect(page.locator('#tab-batch')).toHaveClass(/active/);
+    await expect(page.locator('#tab-history-cloud')).toHaveClass(/active/);
     await expect(page.locator('#btn-send-single')).toBeHidden();
   });
 });
