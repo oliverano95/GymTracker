@@ -322,14 +322,28 @@ function protoAck(id) {
     function(err) { console.log('PROTO: ack failed: ' + JSON.stringify(err)); });
 }
 
+// Report a sync problem.
+//
+// Only ever on a FAILURE, and only once per distinct message: a notification
+// covers whatever is on screen (including this app), so firing one during a
+// normal save makes a routine appear and then vanish. Success is silent — the
+// watch says what it did, on its own screen.
 function protoNotify(message, failed) {
+  if (!failed) return;
+  // Three retries of a failing chunk used to push three notifications, each one
+  // covering the app. Say it once.
+  var line = String(message).replace(/\n/g, ' ');
+  if (line === protoNotify.lastLine && (new Date().getTime() - protoNotify.lastAt) < 60000) return;
+  protoNotify.lastLine = line;
+  protoNotify.lastAt   = new Date().getTime();
   try {
     if (typeof Pebble.showSimpleNotificationOnPebble === 'function') {
-      Pebble.showSimpleNotificationOnPebble(failed ? 'GymTracker: sync' : 'GymTracker',
-                                             message.replace(/\n/g, ' '));
+      Pebble.showSimpleNotificationOnPebble('GymTracker: sync', line);
     }
   } catch (e) { /* notifications are best effort */ }
 }
+protoNotify.lastLine = '';
+protoNotify.lastAt   = 0;
 
 // Parse and reassemble an inbound envelope. Returns the completed body, or
 // null while more chunks are outstanding.

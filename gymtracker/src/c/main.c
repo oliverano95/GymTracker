@@ -11,7 +11,7 @@
 // Shown in the Settings window header so the build on the wrist is obvious at a
 // glance (useful when testing a sideloaded build or an App Store update).
 // MUST match "version" in package.json -- tests/test-version.js checks it.
-#define APP_VERSION "7.1.1"
+#define APP_VERSION "7.1.2"
 
 #define STORAGE_KEY_BASE   100
 #define SETTINGS_KEY_BASE  200
@@ -438,6 +438,9 @@ static void report_clear_staged(void);
 static bool handle_routine_upsert(char *body);
 static bool handle_routine_delete(char *body);
 static bool library_apply_segment(const char *seg, int len, int slot_idx);
+static bool slot_was_upserted(const char *name);
+static void set_upsert_flag(int slot, bool on);
+static void move_upsert_flag(int from, int to);
 
 // Referenced by code that is defined before section 9b.
 static void save_setting(SettingsKey key, int value);
@@ -749,6 +752,7 @@ static void refresh_directory(void) {
         persist_delete(STORAGE_KEY_BASE + i);
         move_slot_int(LAST_COMPLETED_KEY_BASE, i, s_app.storage.active_slots);
         move_slot_int(GHOST_KEY_BASE,          i, s_app.storage.active_slots);
+        move_upsert_flag(i, s_app.storage.active_slots);
       }
 
       snprintf(s_app.storage.slot_names[s_app.storage.active_slots],
@@ -4508,12 +4512,75 @@ static int find_slot_by_name(const char *name) {
 // Erase one slot completely (routine, exercises, history, ghost pacer).
 static void delete_slot(int slot) {
   if (slot < 0 || slot >= MAX_SLOTS) return;
+  set_upsert_flag(slot, false);          // it is gone: nothing to protect
   persist_delete(STORAGE_KEY_BASE + slot);
   persist_delete(GHOST_KEY_BASE + slot);
   persist_delete(LAST_COMPLETED_KEY_BASE + slot);
   for (int j = 0; j < MAX_EXERCISES; j++)
     persist_delete(ROUTINE_EX_BASE + (slot * MAX_EXERCISES) + j);
   refresh_directory();
+}
+
+// ------------------------------------------------------------------------- //
+// Routines that arrived by 'U'                                              //
+//                                                                            //
+// A library ('T') applies make-before-break: whatever it does not name is    //
+// deleted. That is right for a library the user just saved, but a library    //
+// body is a SNAPSHOT, and a 'U' can be newer news than the snapshot — the    //
+// page saves one routine, the app upserts it, and an older library body      //
+// arrives afterwards (a HELLO mismatch, a retried send, a second app         //
+// instance). Without this the routine appears and is then deleted by the     //
+// stale payload, which is exactly the "appears then disappears" report.      //
+//                                                                            //
+// The rule: a routine that arrived by 'U' is kept if the library does not name
+// it. It stops being protected when the phone DELETES it ('D'), or as soon as a
+// library arrives that names it — the snapshot has caught up by then.
+//
+// The flags live in persist, so a reboot mid-sequence neither resurrects nor
+// drops a routine. One int holds all MAX_SLOTS (7) flags. Key 950: 942 is the
+// staged-report length, 943..946 its four chunks, 948/949 the library numbers.
+// ------------------------------------------------------------------------- //
+#define UPSERT_FLAGS_KEY 950
+
+// The staged report owns 942 (length) and 943..946 (four chunks). A future key
+// that lands in that range would corrupt a workout report that is waiting to be
+// re-sent, which is silent and hard to find; fail the build instead.
+_Static_assert(UPSERT_FLAGS_KEY != REPORT_STAGED_LEN_KEY &&
+               (UPSERT_FLAGS_KEY < REPORT_STAGED_BUF_KEY ||
+                UPSERT_FLAGS_KEY >= REPORT_STAGED_BUF_KEY + REPORT_STAGED_CHUNKS),
+               "UPSERT_FLAGS_KEY collides with the staged report keys");
+_Static_assert(UPSERT_FLAGS_KEY != SYNC_SEQ_PHONE_KEY &&
+               UPSERT_FLAGS_KEY != SYNC_EPOCH_ACK_KEY,
+               "UPSERT_FLAGS_KEY collides with the library numbers");
+
+static uint32_t upsert_flags(void) {
+  return persist_exists(UPSERT_FLAGS_KEY) ? (uint32_t)persist_read_int(UPSERT_FLAGS_KEY) : 0;
+}
+
+static void set_upsert_flag(int slot, bool on) {
+  if (slot < 0 || slot >= MAX_SLOTS) return;
+  uint32_t f = upsert_flags();
+  if (on) f |=  (1u << slot);
+  else    f &= ~(1u << slot);
+  persist_write_int(UPSERT_FLAGS_KEY, (int32_t)f);
+}
+
+// Was the routine called `name` set by a 'U' that no library has confirmed yet?
+// The lookup is by name because refresh_directory() compacts slots after every
+// change, so a slot number is not a stable identity.
+static bool slot_was_upserted(const char *name) {
+  if (!name || name[0] == '\0') return false;
+  int slot = find_slot_by_name(name);
+  if (slot < 0) return false;
+  return (upsert_flags() & (1u << slot)) != 0;
+}
+
+// A slot changed position: carry its 'U' flag across the move.
+static void move_upsert_flag(int from, int to) {
+  if (from == to || from < 0 || to < 0 || from >= MAX_SLOTS || to >= MAX_SLOTS) return;
+  uint32_t f = upsert_flags();
+  if ((f & (1u << from)) != 0) set_upsert_flag(to, true);
+  set_upsert_flag(from, false);
 }
 
 // ------------------------------------------------------------------------- //
@@ -4601,6 +4668,11 @@ static bool handle_routine_upsert(char *body) {
 
   refresh_directory();
   if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+
+  // This routine is now newer news than any library body built before it (see
+  // UPSERT_FLAGS_KEY). The flag is cleared when the phone deletes it, or when a
+  // library arrives that names it.
+  set_upsert_flag(find_slot_by_name(upsert_name), true);
 
   vibes_double_pulse();
   proto_fail_visible(replacing ? "Routine updated." : "Routine added.");
@@ -4820,14 +4892,23 @@ static bool handle_library_sync(char *body) {
       return false;
     }
     refresh_directory();   // keep slot_names/counts in step for the next one
+    // The snapshot now names this routine, so a 'U' has nothing left to protect:
+    // from here on the library is the newer news for it again.
+    set_upsert_flag(find_slot_by_name(name[i]), false);
   }
 
   // ---- break: drop everything the phone no longer has --------------------
+  // A routine sent by name ('U') since this library was built is NOT "no longer
+  // on the phone", even if this payload predates it: the payload is a snapshot,
+  // and a 'U' is newer news than the snapshot. Deleting on absence alone made a
+  // routine appear and then vanish when an older library body arrived after its
+  // own upsert, so a name that arrived by 'U' and is still present is kept.
   for (int slot = s_app.storage.active_slots - 1; slot >= 0; slot--) {
     bool keep = false;
     for (int i = 0; i < count; i++) {
       if (strcmp(s_app.storage.slot_names[slot], name[i]) == 0) { keep = true; break; }
     }
+    if (!keep) keep = slot_was_upserted(s_app.storage.slot_names[slot]);
     if (!keep) {
       persist_delete(STORAGE_KEY_BASE + slot);
       persist_delete(GHOST_KEY_BASE + slot);

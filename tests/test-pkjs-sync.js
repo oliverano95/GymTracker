@@ -534,3 +534,46 @@ test.describe('pkjs delete/save, end to end (v9.1)', () => {
 });
 
 
+
+// ---------------------------------------------------------------------------
+// v9.2: a save must not put a notification on the watch.
+//
+// A notification COVERS the running app on Pebble. 7.1.1 fired one from inside
+// the transfer's completion callback, so a routine could appear on the watch
+// and then vanish behind the notification. Success is silent: the watch reports
+// what it did on its own screen.
+// ---------------------------------------------------------------------------
+test.describe('a save is silent (v9.2)', () => {
+  test('a successful save raises no notification', async () => {
+    const store = { savedRoutines: '[]' };
+    const app = loadPkjs(store, makeWatch(0, 0));
+
+    app.close({ cmd: 'save', name: 'Quiet', routine: 'Quiet|Squat|3|5|100|0|-' });
+    await app.settle();
+
+    expect(app.ui.notifications).toEqual([]);
+  });
+
+  test('a successful delete raises no notification', async () => {
+    const store = { savedRoutines: JSON.stringify(['Gone|Squat|3|5|100|0|-']) };
+    const app = loadPkjs(store, makeWatch(0, 0));
+
+    app.close({ cmd: 'delete', name: 'Gone' });
+    await app.settle();
+
+    expect(app.ui.notifications).toEqual([]);
+  });
+
+  test('a failure is still reported, once, not once per retry', async () => {
+    const store = { savedRoutines: '[]' };
+    const app = loadPkjs(store, makeWatch(0, 0), { dropFirst: 99 });
+
+    app.close({ cmd: 'save', name: 'Lost', routine: 'Lost|Squat|3|5|100|0|-' });
+    await app.flush();
+    app.watchdog();
+    await app.settle();
+
+    const repeated = app.ui.notifications.filter((n) => n.indexOf('Sync failed') >= 0);
+    expect(repeated.length).toBeLessThanOrEqual(1);
+  });
+});

@@ -629,3 +629,83 @@ test.describe('Library sync', () => {
     expect(Math.ceil(body.length / PROTO.CHUNK)).toBeLessThanOrEqual(PROTO.MAX_CHUNKS);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v9.2: 'U'/'D' are newer news than a library snapshot.
+//
+// The watch keeps one flag per slot for "this routine arrived by 'U' and no
+// library has confirmed it yet" (UPSERT_FLAGS_KEY in main.c). The break phase
+// of a library apply must keep such a routine even when the payload does not
+// name it, because that payload was built before the upsert.
+//
+// Mirrors handle_library_sync()'s break phase; what this pins down is the rule,
+// which is what the "routine appears then disappears" report came from.
+// ---------------------------------------------------------------------------
+function applyLibraryWithUpserts(state, body) {
+  const r = walkLibrary(body);
+  if (r.error) return r;
+
+  // apply (make): everything the library names, in place; plus clear the flag —
+  // the snapshot has caught up for those names.
+  for (const [name, def] of Object.entries(r.routines)) state.stored[name] = def;
+  for (const name of Object.keys(r.routines)) delete state.upserted[name];
+
+  // break: drop what the library does not name, unless it arrived by 'U'
+  for (const name of Object.keys(state.stored)) {
+    if (name in r.routines) continue;
+    if (state.upserted[name]) continue;      // newer news than this snapshot
+    delete state.stored[name];
+  }
+  return r;
+}
+
+const newState = () => ({ stored: {}, upserted: {} });
+
+function doUpsert(state, name, exStr) {
+  state.stored[name] = name + '|' + exStr;
+  state.upserted[name] = true;
+}
+
+const LIB = (seq, epoch, routines) => libraryBody(seq, epoch, routines);
+
+test.describe('A library cannot undo an upsert (v9.2)', () => {
+  test('a routine that arrived by U survives a stale library that omits it', () => {
+    const s = newState();
+    doUpsert(s, 'New One', 'Bench Press|3|8|60|0|-');
+
+    // A payload built BEFORE the upsert: it only knows the old routine.
+    applyLibraryWithUpserts(s, LIB(10, 100, [{ n: 1, name: 'Old One', ex: ['Squat', 3, 5, 100, 0, '-'] }]));
+
+    expect(Object.keys(s.stored).sort()).toEqual(['New One', 'Old One']);
+  });
+
+  test('a library that does name it clears the protection', () => {
+    const s = newState();
+    doUpsert(s, 'New One', 'Bench Press|3|8|60|0|-');
+    applyLibraryWithUpserts(s, LIB(11, 101, [
+      { n: 1, name: 'New One', ex: ['Bench Press', 3, 8, 60, 0, '-'] },
+    ]));
+    expect(s.upserted['New One']).toBeUndefined();
+
+    // Now absence DOES mean deleted, as it must.
+    applyLibraryWithUpserts(s, LIB(12, 102, []));
+    expect(Object.keys(s.stored)).toEqual([]);
+  });
+
+  test('an older routine is still deleted by a library that omits it', () => {
+    const s = newState();
+    s.stored['Old One'] = 'Old One|Squat|3|5|100|0|-';
+    applyLibraryWithUpserts(s, LIB(13, 103, []));
+    expect(Object.keys(s.stored)).toEqual([]);
+  });
+
+  test('a delete removes it for good, even on the next library', () => {
+    const s = newState();
+    doUpsert(s, 'Temp', 'Curl|3|12|15|0|-');
+    delete s.stored['Temp'];
+    delete s.upserted['Temp'];               // what delete_slot() does
+
+    applyLibraryWithUpserts(s, LIB(14, 104, []));
+    expect(Object.keys(s.stored)).toEqual([]);
+  });
+});
