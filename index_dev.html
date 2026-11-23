@@ -322,18 +322,24 @@
 // CONSTANTS
 // ============================================================
 const MAX_BATCH       = 7;
-const MAX_ROUTINE_LEN = 1300;  // real worst-case: 15 exercises × ~79 chars + name = ~1216
+// Longest serialised routine accepted. Measured on a real device with
+// probe.html: a routine of 1046 chars (15 exercises, long names, a 31-char note
+// each) encodes to 1620 in the close-URL and arrives intact; 2000 was the
+// largest payload tested and it arrived intact too. 1100 raw keeps every
+// realistic routine inside that budget with room to spare.
+const MAX_ROUTINE_LEN = 1100;
 const MAX_EXERCISES   = 15;    // mirrors #define MAX_EXERCISES in main.c
 const MAX_SETS        = 10;    // mirrors the 10-entry actual_reps/actual_weight arrays in main.c
 const MAX_HISTORY     = 30;
 
-// The pebblejs://close# response is still the transport out of the webview, so
-// it must stay small. It no longer carries routines at all: the page writes
-// them to localStorage (which the phone app reads from its own storage, since
-// the two do not share one) and only reports "the library changed" here.
-// Measured on a real device: 252 and 279 encoded chars deliver, 672 does not,
-// so this cap keeps the response in the range that is known to work.
-const MAX_CONFIG_RESPONSE = 450;
+// Budget for the pebblejs://close# response, in percent-encoded characters.
+//
+// This used to be 450, based on a comment claiming 279 worked and 672 did not.
+// That is not true on current hardware: probe.html measured 100/200/279/350/
+// 450/550/672/800/1000/1200/1500/2000 all arriving with an exact length match,
+// so nothing was truncated at any of them. 1800 leaves a 10% margin under the
+// largest size actually verified while comfortably fitting the worst routine.
+const MAX_CONFIG_RESPONSE = 1800;
 
 // Settings blobs that legitimately exceed the cap (large workout history) are
 // trimmed rather than blocked — see buildConfigPayload.
@@ -531,9 +537,6 @@ function deleteRoutine() {
     Storage.setJSON('savedRoutines', routines);
     if (getLastRoutine() === name) Storage.remove('lastRoutine');
 
-    // Drop the routine from the library, then push the library to the watch so
-    // the slot disappears there too. A delete made ON the watch is the opposite
-    // case: it stays local and the routine reappears on the next phone send.
     loadedRoutineName = '';
 
     document.getElementById('routineName').value     = '';
@@ -543,7 +546,14 @@ function deleteRoutine() {
     renderRoutine();
     updateProgressionUI();
     loadSavedRoutines();
-    sendRoutineToPebble();
+
+    // Close with a command that deletes the routine by name on the watch too.
+    // This is the one case where a website action removes something from the
+    // watch; a delete made ON the watch does not come back here.
+    const payload = { cmd: 'delete', name: name };
+    const settings = buildConfigPayload();
+    Object.keys(settings).forEach((k) => { payload[k] = settings[k]; });
+    sendToPebble(payload);
 }
 
 // ============================================================
@@ -1053,12 +1063,14 @@ function serialiseRoutine(name, exercises) {
 // ============================================================
 // CONFIG RESPONSE
 // ============================================================
-// The response out of the webview carries only small control flags. Routines
-// never travel through it: the page owns `savedRoutines` in localStorage, and
-// the phone app reads that library out of its own storage when it sees
-// `libraryChanged`. Nothing is parked for the phone to pick up, because the
-// webview and the phone app do not share storage — that is precisely why the
-// old 'pendingRoutine' hand-off silently did nothing.
+// The response out of the webview is the ONLY channel from this page to the
+// phone app: the webview and the phone app have separate localStorage, so
+// writing to `savedRoutines` here is invisible to it. Everything the phone
+// needs therefore travels in the pebblejs://close# payload:
+//
+//   {cmd:'save',   name, routine}   add or replace ONE routine
+//   {cmd:'delete', name}            delete ONE routine by name
+//   plus the usual settings fields (progression, history, credentials)
 function buildConfigPayload() {
     // Only include fields that are actually set: unset ones cost URL headroom
     // and the phone app keeps the previous value when a field is absent.
@@ -1076,18 +1088,36 @@ function buildConfigPayload() {
 }
 
 // Save the editor's routine into the stored library, then close the webview
-// with "the library changed" so the phone app pushes the whole library.
-function sendRoutineToPebble() {
-    const payload = buildConfigPayload();
-    payload.libraryChanged = true;
-    sendToPebble(payload);
+// with a "save this routine" command for the phone app.
+//
+// The routine travels in the close-URL itself. This is the supported channel
+// (App Configuration docs): the page navigates to pebblejs://close#<data> and
+// the phone app receives it as e.response. The webview's localStorage is NOT
+// shared with the phone app's, which is why the old "park it in storage and
+// send a libraryChanged flag" approach silently did nothing.
+//
+// Measured on the device with probe.html: 2000-character payloads arrive
+// intact, so a routine up to MAX_ROUTINE_LEN always fits. No compression.
+function sendRoutineToPebble(name, routineStr) {
+    const payload = {
+        cmd:     'save',
+        name:    name,
+        routine: routineStr
+    };
+
+    // The close-URL also has to carry the settings the app applies (progression
+    // mode, increments, history, credentials), so merge them in.
+    const settings = buildConfigPayload();
+    Object.keys(settings).forEach((k) => { payload[k] = settings[k]; });
+
+    return sendToPebble(payload);
 }
 
 function sendToPebble(configData) {
     const returnTo = getQueryParam('return_to', 'pebblejs://close#');
 
-    // If the blob is still too long it is the history that is oversized; drop
-    // the oldest entries instead of refusing to save.
+    // Workout history is the only part that can blow the budget, and it is
+    // disposable: drop the oldest entries instead of refusing to save.
     let guard = 0;
     let encoded = encodeURIComponent(JSON.stringify(configData));
 
@@ -1099,10 +1129,15 @@ function sendToPebble(configData) {
     }
 
     if (encoded.length > MAX_CONFIG_RESPONSE) {
-        alert(`⚠️ Settings are ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-char limit the Pebble app can transfer. This is usually a very long Google Sheets URL; please shorten it.`);
-        return;
+        // The routine itself is never trimmed: losing a silently truncated
+        // routine is exactly the bug this whole design exists to avoid.
+        alert(`⚠️ This is ${encoded.length} characters — over the ${MAX_CONFIG_RESPONSE}-character limit the Pebble app can transfer.\n\n` +
+              `If you configured a Google Sheets URL, try shortening it. Otherwise remove the history and try again.`);
+        return false;
     }
+
     window.location.href = returnTo + encoded;
+    return true;
 }
 
 // Parse a watch sync string ("Name|prog|inc|ex|sets|reps|weight|mod|cmt|...")
@@ -1230,9 +1265,9 @@ function saveAndSendSingle() {
         }
 
         // Detect a rename: the editor holds a routine loaded under a different
-        // name, so the old entry has to leave the library (issue #46). The old
-        // name used to be tombstoned for the watch; now it is simply absent
-        // from the library that gets sent.
+        // name, so the old entry leaves this list. The watch is handled by the
+        // send below (it keys routines by name, so the old name simply stays
+        // there until it is deleted).
         const renameFrom = (loadedRoutineName && loadedRoutineName !== name) ? loadedRoutineName : null;
 
         saveRoutineToStorage(name, myRoutine,
@@ -1241,14 +1276,18 @@ function saveAndSendSingle() {
             renameFrom);
         loadedRoutineName = name;   // the new name is the baseline from now on
         loadSavedRoutines();
+
+        // Send THIS routine only. The watch upserts by name: an existing name
+        // has its exercises replaced, a new one is added, and every other
+        // routine on the watch is left untouched.
+        const sent = sendRoutineToPebble(name, routineStr);
+        if (!sent) return;          // sendToPebble already explained why
     }
 
     // Settings-only saves (Google credentials, history) do not touch routines,
-    // so they close the webview without asking the watch for a library push.
+    // so they close the webview without touching the watch's routines.
     if (settingsOnly) {
         sendToPebble(buildConfigPayload());
-    } else {
-        sendRoutineToPebble();
     }
 }
 
