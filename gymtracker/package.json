@@ -19,7 +19,8 @@
             "PROTO_ACK",
             "SYNC_SEQUENCE",
             "SYNC_EPOCH",
-            "SYNC_FLAGS"
+            "SYNC_FLAGS",
+            "DIAG"
         ],
         "projectType": "native",
         "resources": {
@@ -47,5 +48,5 @@
             "watchface": false
         }
     },
-    "version": "7.0.2"
+    "version": "7.1.0"
 }

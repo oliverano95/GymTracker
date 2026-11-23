@@ -8,6 +8,11 @@
 #define EXPORT_BUF_SIZE 2048
 #define MAX_HR_SERIES 180
 
+// Shown in the Settings window header so the build on the wrist is obvious at a
+// glance (useful when testing a sideloaded build or an App Store update).
+// MUST match "version" in package.json -- tests/test-version.js checks it.
+#define APP_VERSION "7.1.0"
+
 #define STORAGE_KEY_BASE   100
 #define SETTINGS_KEY_BASE  200
 #define ACTIVE_STATE_KEY   300
@@ -226,6 +231,7 @@ typedef struct {
   bool note_toast_visible;
 
   TextLayer *main_header_text, *settings_header_text, *timer_layer, *clock_layer;
+  TextLayer *settings_version_text;
   TextLayer *exercise_layer, *next_exercise_layer, *set_layer, *label_reps_layer;
   TextLayer *label_weight_layer, *target_reps_layer, *target_weight_layer;
   TextLayer *actual_reps_layer, *actual_weight_layer, *help_text_layer;
@@ -427,6 +433,12 @@ static void report_stage_and_send(void);
 static void report_retry_staged(void);
 static void report_clear_staged(void);
 
+// v9 per-routine sync ('U' upsert, 'D' delete). Declared here because
+// proto_dispatch() is defined before them.
+static bool handle_routine_upsert(char *body);
+static bool handle_routine_delete(char *body);
+static bool library_apply_segment(const char *seg, int len, int slot_idx);
+
 // Referenced by code that is defined before section 9b.
 static void save_setting(SettingsKey key, int value);
 static char *report_stage_buf;
@@ -578,6 +590,43 @@ static void save_setting(SettingsKey key, int value) {
   persist_write_int(SETTINGS_KEY_BASE + (int)key, value);
 }
 
+// ------------------------------------------------------------------------- //
+// 7.0.3: hand-rolled decimal parser.                                         //
+// ------------------------------------------------------------------------- //
+// Do NOT use strtol()/strtoul() in this app: newlib's versions start with     //
+// `ldr r0, [pc, #n]` -> `_impure_ptr` -> `ldr`, and `_impure_ptr` is a data   //
+// word that only the libc startup code initialises. Pebble apps link newlib   //
+// for a few functions but never run its init, so the word is 0 and the first  //
+// instruction faults:                                                        //
+//   App fault! PC: 0x8bb4  (strtol, first instr: ldr r0, [r2, #0])           //
+// Any text message that reached the v8 protocol killed the app on launch,    //
+// which is exactly what a routine library sync does right after install.     //
+// atoi() is fine -- on this target it is a syscall into the firmware.        //
+// ------------------------------------------------------------------------- //
+// Parses [+-]<digits>. On success stores the value in *out, points *end at    //
+// the first character that is not a digit and returns true. On failure *end   //
+// is left untouched and false is returned.
+static bool parse_dec(const char **p, long *out, char **end) {
+  const char *s = *p;
+  const char *start = s;
+  bool neg = false;
+
+  if (*s == '+' || *s == '-') { neg = (*s == '-'); s++; }
+  if (*s < '0' || *s > '9') return false;
+
+  long value = 0;
+  while (*s >= '0' && *s <= '9') {
+    // Saturate instead of wrapping: every caller range-checks the result.
+    if (value < 100000000L) value = value * 10 + (*s - '0');
+    s++;
+  }
+
+  *out = neg ? -value : value;
+  if (end) *end = (char *)s;
+  *p = s;
+  return s > start + (neg || *start == '+' ? 1 : 0);
+}
+
 static void parse_routine_string(const char *data) {
   s_app.state.total_exercises = 0;
   memset(&s_app.state.exercises, 0, sizeof(s_app.state.exercises));
@@ -597,12 +646,17 @@ static void parse_routine_string(const char *data) {
 
         if (ex_idx < MAX_EXERCISES) {
           Exercise *ex = &s_app.state.exercises[ex_idx];
+          // An empty field parses as 0. atoi() is not used directly because its
+          // return value for "" is unspecified; routines may legitimately carry
+          // a blank note (field 5), and a blank numeric field must not become
+          // garbage.
+          int num = (temp[0] == '\0') ? 0 : atoi(temp);
           if      (field == 0) snprintf(ex->name,    sizeof(ex->name),    "%s", temp);
-          else if (field == 1) ex->target_sets   = atoi(temp);
-          else if (field == 2) ex->target_reps   = atoi(temp);
-          else if (field == 3) ex->target_weight = atoi(temp);
+          else if (field == 1) ex->target_sets   = num;
+          else if (field == 2) ex->target_reps   = num;
+          else if (field == 3) ex->target_weight = num;
           else if (field == 4) {
-            ex->modifier = atoi(temp);
+            ex->modifier = num;
             if (ex->modifier == 4) { ex->modifier = 0; ex->target_weight = 0; }
             // 6 = timed (count up), 8 = timed (count down, issue #61): both
             // time an unweighted hold, so weight is never part of the set.
@@ -1679,9 +1733,20 @@ static void settings_window_load(Window *window) {
   menu_layer_set_highlight_colors(s_app.ui.settings_menu_layer, get_theme_color(), get_bg_color());
   menu_layer_set_click_config_onto_window(s_app.ui.settings_menu_layer, window);
   layer_add_child(w_layer, menu_layer_get_layer(s_app.ui.settings_menu_layer));
+
+  // App version, top-right of the header. Added after the menu layer so it is
+  // drawn on top of it. The font is small enough that "7.0.3" clears the
+  // centred "Settings" title on every screen width.
+  GRect ver_rect = GRect(bounds.size.w - 44, 1, 40, 16);
+  s_app.ui.settings_version_text = build_text_layer(ver_rect, FONT_KEY_GOTHIC_14,
+    GColorWhite, GTextAlignmentRight, NULL);
+  text_layer_set_text(s_app.ui.settings_version_text, APP_VERSION);
+  layer_add_child(w_layer, text_layer_get_layer(s_app.ui.settings_version_text));
 }
 
 static void settings_window_unload(Window *window) {
+  text_layer_destroy(s_app.ui.settings_version_text);
+  s_app.ui.settings_version_text = NULL;
   text_layer_destroy(s_app.ui.settings_header_text);
   layer_destroy(s_app.ui.settings_header_bg);
   menu_layer_destroy(s_app.ui.settings_menu_layer);
@@ -3963,6 +4028,9 @@ static void main_window_load(Window *window) {
   text_layer_set_text(s_app.ui.main_header_text, "Select Routine");
 
   s_app.ui.menu_layer = menu_layer_create(GRect(0, 40, bounds.size.w, bounds.size.h - 40));
+  // A routine save can land while another window is on top (the user is often
+  // sitting in Settings when the phone finishes a sync), so the directory has to
+  // be read here rather than only in init().
   refresh_directory();
   menu_layer_set_callbacks(s_app.ui.menu_layer, NULL, (MenuLayerCallbacks){
     .get_num_rows      = menu_get_num_rows_callback,
@@ -4120,6 +4188,40 @@ static uint16_t s_proto_in_expected = 0;
 static uint16_t s_proto_in_got = 0;
 static char s_proto_in_id[8] = "0";
 static char s_proto_in_type = 0;
+
+// v7.0.4: id of the library chunk currently being acknowledged. Kept separately
+// from s_proto_in_id because that one is rewritten by the next envelope header
+// even when the chunk is rejected, so ACKing with it would acknowledge a chunk
+// we never accepted.
+static char s_proto_ack_id[8] = "0";
+
+// v7.0.4: ids we have already ACKed but did not apply (stale sequence, refused
+// payload, out-of-order chunk). A retransmit of such a chunk is ACKed again
+// instead of being dropped silently: the sender's success callback is what
+// advances its queue, so a chunk that is never ACKed wedges the whole transfer
+// on the phone for the rest of its life.
+#define PROTO_HANDLED_MAX 8
+static char s_proto_handled[PROTO_HANDLED_MAX][8];
+
+static void proto_mark_handled(const char *id) {
+  if (!id || !id[0]) return;
+  for (int i = 0; i < PROTO_HANDLED_MAX; i++) {
+    if (strcmp(s_proto_handled[i], id) == 0) return;
+  }
+  // Ring: the oldest slot is overwritten once full. An id only has to be
+  // remembered until its transfer times out, which is a few seconds.
+  static int next = 0;
+  snprintf(s_proto_handled[next], sizeof(s_proto_handled[next]), "%s", id);
+  next = (next + 1) % PROTO_HANDLED_MAX;
+}
+
+static bool proto_was_handled(const char *id) {
+  if (!id || !id[0]) return false;
+  for (int i = 0; i < PROTO_HANDLED_MAX; i++) {
+    if (s_proto_handled[i][0] && strcmp(s_proto_handled[i], id) == 0) return true;
+  }
+  return false;
+}
 
 // Pointer to the live export buffer that staging copies from.
 // (Declared near the top so summary_window_load can assign it.)
@@ -4403,6 +4505,133 @@ static int find_slot_by_name(const char *name) {
   return -1;
 }
 
+// Erase one slot completely (routine, exercises, history, ghost pacer).
+static void delete_slot(int slot) {
+  if (slot < 0 || slot >= MAX_SLOTS) return;
+  persist_delete(STORAGE_KEY_BASE + slot);
+  persist_delete(GHOST_KEY_BASE + slot);
+  persist_delete(LAST_COMPLETED_KEY_BASE + slot);
+  for (int j = 0; j < MAX_EXERCISES; j++)
+    persist_delete(ROUTINE_EX_BASE + (slot * MAX_EXERCISES) + j);
+  refresh_directory();
+}
+
+// ------------------------------------------------------------------------- //
+// 'U' — upsert ONE routine, phone -> watch.                                   //
+//                                                                            //
+// The phone sends a single routine and nothing else; the watch decides what   //
+// to do with it from the NAME:                                               //
+//                                                                            //
+//   * a routine with that name already exists  -> replace its exercises      //
+//   * no routine with that name                -> add it to the first free   //
+//                                                 slot                      //
+//   * no free slot                             -> refuse, keep the old state //
+//                                                                            //
+// Routines not mentioned are never touched, so sending one routine can no     //
+// longer wipe the others (which is what the whole-library 'T' message did).   //
+//                                                                            //
+// Body: "<routine name>|<exercise>|<exercise>|..." — the same serialisation    //
+// the config page produces, so no reshaping happens anywhere in the chain.    //
+// The exercise count is derived from the field balance rather than being sent.//
+// ------------------------------------------------------------------------- //
+static bool handle_routine_upsert(char *body) {
+  if (!body || body[0] == '\0') { proto_fail_visible("Routine rejected.\nEmpty."); return false; }
+
+  // ---- the routine name, up to the first '|' ----------------------------
+  const char *name_at = body;
+  int name_len = 0;
+  while (name_at[name_len] && name_at[name_len] != '|') name_len++;
+
+  if (name_len == 0)               { proto_fail_visible("Routine rejected.\nNo name."); return false; }
+  if (name_len >= 32)              { proto_fail_visible("Routine rejected.\nName too long."); return false; }
+  if (name_at[name_len] == '\0')   { proto_fail_visible("Routine rejected.\nNo exercises."); return false; }
+
+  char upsert_name[32];
+  memcpy(upsert_name, name_at, (size_t)name_len);
+  upsert_name[name_len] = '\0';
+
+  // ---- count the exercises from the field balance -----------------------
+  // Every exercise contributes exactly six fields, so the count is the number
+  // of fields after the name divided by six. Nothing is written until this is
+  // consistent and every field has been seen.
+  const char *fields = name_at + name_len;      // at the name's '|'
+  int field_count = 0;
+  const char *end = fields;
+
+  while (*end) {
+    if (*end != '|') { proto_fail_visible("Routine rejected.\nMalformed."); return false; }
+    end++;                                      // over the delimiter
+    while (*end && *end != '|') end++;          // then over the field
+    field_count++;
+  }
+
+  if (field_count < 6 || (field_count % 6) != 0) {
+    proto_fail_visible("Routine rejected.\nIncomplete.");
+    return false;
+  }
+  int ex_count = field_count / 6;
+  if (ex_count > MAX_EXERCISES) {
+    proto_fail_visible("Routine rejected.\nToo many exercises.");
+    return false;
+  }
+
+  // ---- choose the slot ---------------------------------------------------
+  int slot = find_slot_by_name(upsert_name);
+  bool replacing = (slot >= 0);
+
+  if (!replacing) {
+    slot = s_app.storage.active_slots;          // compacted, so this is the free one
+    if (slot >= MAX_SLOTS) {
+      proto_fail_visible("Routine rejected.\nNo free slot.");
+      return false;
+    }
+  }
+
+  // ---- apply -------------------------------------------------------------
+  // merge_history keeps the reps/weights already logged against exercises with
+  // the same name, so re-sending a routine does not wipe the numbers recorded
+  // for it. A brand-new routine starts clean.
+  int seg_len = (int)(end - name_at);
+  if (!library_apply_segment(name_at, seg_len, slot)) {
+    proto_fail_visible("Routine rejected.\nBad routine.");
+    refresh_directory();
+    if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+    return false;
+  }
+
+  refresh_directory();
+  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+
+  vibes_double_pulse();
+  proto_fail_visible(replacing ? "Routine updated." : "Routine added.");
+  return true;
+}
+
+// ------------------------------------------------------------------------- //
+// 'D' — delete ONE routine by name, phone -> watch.                          //
+//                                                                            //
+// Deleting a name that is not present is not an error: the phone and the     //
+// watch agree that the routine is gone, which is exactly what we want.       //
+// Body: "<routine name>"                                                     //
+// ------------------------------------------------------------------------- //
+static bool handle_routine_delete(char *body) {
+  if (!body || body[0] == '\0') { proto_fail_visible("Delete rejected.\nNo name."); return false; }
+  if (strlen(body) >= 32)       { proto_fail_visible("Delete rejected.\nName too long."); return false; }
+
+  int slot = find_slot_by_name(body);
+  if (slot < 0) {
+    // Already absent: nothing to do, and no reason to bother the user.
+    return true;
+  }
+
+  delete_slot(slot);
+  if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
+
+  vibes_double_pulse();
+  proto_fail_visible("Routine deleted.");
+  return true;
+}
+
 // ------------------------------------------------------------------------- //
 // 'T' — the routine library, phone -> watch. This is the ONLY way routine    //
 // definitions reach the watch, and it always carries EVERY routine, so       //
@@ -4424,7 +4653,10 @@ static bool library_apply_segment(const char *seg, int len, int slot_idx) {
   static char *one = s_sync_buf;
   if (len <= 0 || len >= ARENA_SIZE) return false;
 
-  memcpy(one, seg, len);
+  // `seg` can point INSIDE the arena: the 'U' handler passes a segment of the
+  // reassembled body, which lives at the head of the same buffer. memcpy() with
+  // overlapping regions is undefined behaviour, so move instead of copy.
+  memmove(one, seg, (size_t)len);
   one[len] = '\0';
 
   // A routine that is still present keeps the actuals recorded against it; a
@@ -4439,30 +4671,74 @@ static bool library_apply_segment(const char *seg, int len, int slot_idx) {
 // a chunk for good is refused), and every routine is preceded by its exercise
 // count, which makes the boundaries exact. Applies the whole library or
 // nothing at all.
-static void handle_library_sync(char *body) {
+//
+// v7.0.4: returns true when the transfer was *handled* -- applied, or refused
+// because it is stale -- and false when the body itself was malformed. A
+// handled transfer must be ACKed; an un-ACKed one stalls the phone's queue and
+// no later library can be sent (see inbox_received_callback).
+static bool handle_library_sync(char *body) {
   // ---- header: marker, seq, epoch, declared length -----------------------
-  if (body[0] != 'T' || body[1] != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
+  if (body[0] != 'T' || body[1] != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return false; }
 
-  char *p = body + 2;
-  uint32_t seq   = (uint32_t)strtoul(p, &p, 10);
-  if (*p != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
-  uint32_t epoch = (uint32_t)strtoul(p + 1, &p, 10);
-  if (*p != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
-  unsigned long declared = strtoul(p + 1, &p, 10);
-  if (*p != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return; }
-  char *lib = p + 1;
+  const char *p = body + 2;
+  long seq = 0, epoch = 0, declared = 0;
+  char *q = NULL;
 
-  if ((unsigned long)strlen(lib) != declared) {
+  if (!parse_dec(&p, &seq, &q) || *q != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return false; }
+  p = q + 1;
+  if (!parse_dec(&p, &epoch, &q) || *q != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return false; }
+  p = q + 1;
+  if (!parse_dec(&p, &declared, &q) || *q != '|') { proto_fail_visible("Routine sync rejected.\nBad header."); return false; }
+  char *lib = q + 1;
+
+  // ---- length check ------------------------------------------------------
+  // The phone fills `declared` with JavaScript's String.length, which counts
+  // UTF-16 code units; strlen() here counts UTF-8 bytes. Any non-ASCII character
+  // in a routine (an accent, a non-breaking space pasted from a web page, a
+  // typographic dash) makes the two disagree, so a strict equality test threw
+  // away perfectly good libraries: the watch repainted "Truncated." and the
+  // routines never appeared, while the chunk was still ACKed.
+  //
+  // The length is therefore only a sanity envelope, not an exact contract:
+  //   * UTF-8 is never FEWER bytes than UTF-16 units, so bytes >= declared is
+  //     the normal case and any shortfall is a genuinely lost chunk.
+  //   * The routine walk below is self-delimiting (each exercise count is in
+  //     the stream), so it detects real truncation on its own.
+  //   * An older phone builds straight from the wire in bytes, so an exact
+  //     match (bytes == declared) must also pass.
+  unsigned long actual   = (unsigned long)strlen(lib);
+  unsigned long declaredu = (unsigned long)(declared < 0 ? 0 : declared);
+
+  if (actual < declaredu) {
     proto_fail_visible("Routine sync rejected.\nTruncated.");
-    return;
+    return false;
   }
 
   // ---- stale or duplicate transfer? ------------------------------------
-  // Sequence numbers strictly increase, so a retransmitted or out-of-order
-  // library is dropped instead of being applied twice.
-  if (seq != 0 && seq <= s_seq_phone) {
+  // Two different things are being decided here, and they must not be mixed:
+  //
+  //   * Applying: the library must be newer than the one already applied, or a
+  //     retransmit of an old body would resurrect deleted routines.
+  //
+  //   * The record: (seq, epoch) must end up holding what the PHONE just said,
+  //     whatever it was. The phone's counters live in its own storage (plus two
+  //     values the phone app caches when the watch sends it a HELLO), and after
+  //     an upgrade or a reinstall of either side they can be lower than the
+  //     numbers this watch remembers. Keeping the higher ones is what created
+  //     the "saving does nothing" state: the phone could never climb back up to
+  //     them, so every save looked stale for good.
+  //
+  // A same-sequence library with a newer epoch is applied: that is what a
+  // re-save of an unchanged library looks like when both sides agree on seq.
+  bool same_seq_newer_epoch = (seq == (long)s_seq_phone &&
+                               epoch > (int)persist_read_int(SYNC_EPOCH_ACK_KEY));
+
+  if (seq != 0 && seq <= (long)s_seq_phone && !same_seq_newer_epoch) {
+    s_seq_phone = (uint32_t)seq;
+    persist_write_int(SYNC_SEQ_PHONE_KEY, (int32_t)seq);
+    persist_write_int(SYNC_EPOCH_ACK_KEY, (int32_t)epoch);
     proto_fail_visible("Routine sync: already up to date.");
-    return;
+    return true;
   }
 
   // ---- split into routines ---------------------------------------------
@@ -4473,7 +4749,7 @@ static void handle_library_sync(char *body) {
   size_t lib_len = strlen(lib);
   if (lib_len + 1 > ARENA_SIZE - PROTO_IN_BUF_SIZE) {
     proto_fail_visible("Routine sync rejected.\nToo large.");
-    return;
+    return false;
   }
   memcpy(buf, lib, lib_len + 1);
 
@@ -4488,14 +4764,15 @@ static void handle_library_sync(char *body) {
   // Nothing is written to storage yet, so a body that turns out to be malformed
   // half way through leaves the existing library untouched.
   while (*cursor != '\0') {
-    if (count >= MAX_SLOTS) { proto_fail_visible("Routine sync rejected.\nToo many routines."); return; }
+    if (count >= MAX_SLOTS) { proto_fail_visible("Routine sync rejected.\nToo many routines."); return false; }
 
     // Exercise count for this routine.
+    long ex = 0;
     char *q = NULL;
-    long ex = strtol(cursor, &q, 10);
-    if (!q || q == cursor || *q != '|' || ex < 1 || ex > MAX_EXERCISES) {
+    const char *num = cursor;
+    if (!parse_dec(&num, &ex, &q) || *q != '|' || ex < 1 || ex > MAX_EXERCISES) {
       proto_fail_visible("Routine sync rejected.\nBad routine count.");
-      return;
+      return false;
     }
     char *name_at = q + 1;
 
@@ -4507,12 +4784,12 @@ static void handle_library_sync(char *body) {
       p++;
     }
     name[count][n] = '\0';
-    if (*p != '|' || n == 0) { proto_fail_visible("Routine sync rejected.\nUnnamed routine."); return; }
+    if (*p != '|' || n == 0) { proto_fail_visible("Routine sync rejected.\nUnnamed routine."); return false; }
 
     // Skip n groups of six fields.
     char *end = p;                       // the name's '|'
     for (int f = 0; f < (int)ex * 6; f++) {
-      if (*end != '|') { proto_fail_visible("Routine sync rejected.\nBad routine."); return; }
+      if (*end != '|') { proto_fail_visible("Routine sync rejected.\nBad routine."); return false; }
       end++;                             // over the delimiter
       while (*end && *end != '|') end++; // then over the field
     }
@@ -4525,7 +4802,7 @@ static void handle_library_sync(char *body) {
 
     if (*end == '\0') break;             // last routine
     end++;                               // the '|' that starts the next count
-    if (*end == '\0') { proto_fail_visible("Routine sync rejected.\nBad routine."); return; }
+    if (*end == '\0') { proto_fail_visible("Routine sync rejected.\nBad routine."); return false; }
     cursor = end;
   }
 
@@ -4534,13 +4811,13 @@ static void handle_library_sync(char *body) {
     int slot = find_slot_by_name(name[i]);
     if (slot < 0) {
       slot = s_app.storage.active_slots;    // compacted, so this is the free one
-      if (slot >= MAX_SLOTS) { proto_fail_visible("Routine sync rejected.\nNo free slot."); return; }
+      if (slot >= MAX_SLOTS) { proto_fail_visible("Routine sync rejected.\nNo free slot."); return false; }
     }
     if (!library_apply_segment(seg[i], seg_len[i], slot)) {
       proto_fail_visible("Routine sync rejected.\nBad routine.");
       refresh_directory();
       if (s_app.ui.menu_layer) menu_layer_reload_data(s_app.ui.menu_layer);
-      return;
+      return false;
     }
     refresh_directory();   // keep slot_names/counts in step for the next one
   }
@@ -4562,7 +4839,7 @@ static void handle_library_sync(char *body) {
   }
 
   // ---- commit the sequence numbers --------------------------------------
-  s_seq_phone = seq;
+  s_seq_phone = (uint32_t)seq;
   persist_write_int(SYNC_SEQ_PHONE_KEY, (int32_t)seq);
   persist_write_int(SYNC_EPOCH_ACK_KEY, (int32_t)epoch);
 
@@ -4571,18 +4848,22 @@ static void handle_library_sync(char *body) {
 
   vibes_double_pulse();
   proto_fail_visible("Routines synced.");
+  return true;
 }
 
 // ------------------------------------------------------------------------- //
 // Routing: hand a fully reassembled body to the handler for its type. Only    //
 // two transfers exist: 'T' (library, phone -> watch) and 'W' (the phone's     //
 // acknowledgement of the report we sent). Anything else is ignored.           //
+// Returns true when the transfer was handled and should be ACKed.             //
 // ------------------------------------------------------------------------- //
-static void proto_dispatch(char type, char *body) {
+static bool proto_dispatch(char type, char *body) {
   switch (type) {
-    case 'T': handle_library_sync(body); break;   // library, make before break
-    case 'W': report_clear_staged();     break;   // phone confirmed the report
-    default:  break;
+    case 'U': return handle_routine_upsert(body);  // one routine, add or replace
+    case 'D': return handle_routine_delete(body);  // one routine, by name
+    case 'T': return handle_library_sync(body);   // library, make before break
+    case 'W': report_clear_staged(); return true; // phone confirmed the report
+    default:  return false;
   }
 }
 
@@ -4590,33 +4871,34 @@ static void proto_dispatch(char type, char *body) {
 // Inbound envelope: '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'                  //
 // Chunks are appended to s_proto_in_buf until seq == total, then dispatched.  //
 // ------------------------------------------------------------------------- //
+// The id of the transfer being parsed right now. It is copied into
+// s_proto_in_id only once a chunk is accepted, so a rejected chunk can never
+// overwrite the id of the transfer in progress.
+static char s_proto_in_id_current[8] = "0";
+
 static bool proto_handle_envelope(const char *msg) {
   // Parse the four fixed fields, then take the rest verbatim as the body.
   const char *p = msg;
-
+  long ver = 0, id = 0, seq = 0, total = 0;
   char *end = NULL;
-  long ver = strtol(p, &end, 10);
-  if (!end || *end != '|') return false;
+
+  if (!parse_dec(&p, &ver, &end) || *end != '|') return false;
   p = end + 1;
 
   char type = *p;
   if (type == '\0' || *(p + 1) != '|') return false;
   p += 2;
 
-  end = NULL;
-  long id = strtol(p, &end, 10);
-  if (!end || *end != '|') return false;
+  if (!parse_dec(&p, &id, &end) || *end != '|') return false;
   snprintf(s_proto_in_id, sizeof(s_proto_in_id), "%ld", id);
+  snprintf(s_proto_ack_id, sizeof(s_proto_ack_id), "%ld", id);
+  snprintf(s_proto_in_id_current, sizeof(s_proto_in_id_current), "%ld", id);
   p = end + 1;
 
-  end = NULL;
-  long seq = strtol(p, &end, 10);
-  if (!end || *end != '/') return false;
+  if (!parse_dec(&p, &seq, &end) || *end != '/') return false;
   p = end + 1;
 
-  end = NULL;
-  long total = strtol(p, &end, 10);
-  if (!end || *end != '|') return false;
+  if (!parse_dec(&p, &total, &end) || *end != '|') return false;
   const char *body = end + 1;
 
   if (!proto_version_ok((int)ver)) {
@@ -4626,7 +4908,12 @@ static bool proto_handle_envelope(const char *msg) {
   }
   proto_note_version((int)ver);
 
-  if (total < 1 || seq < 1 || seq > total) return false;
+  if (total < 1 || seq < 1 || seq > total) {
+    // Not a usable chunk, but the id was understood: ACK it so the sender's
+    // queue moves on instead of stalling on this transfer forever.
+    proto_mark_handled(s_proto_ack_id);
+    return false;
+  }
   if (total > PROTO_MAX_CHUNKS) {
     // More chunks than we can reassemble: this is not a transport failure, the
     // library is genuinely too big for this watch. Say so and tell the phone
@@ -4636,27 +4923,46 @@ static bool proto_handle_envelope(const char *msg) {
     proto_fail_visible(why);
     s_sync_failed = true;
     proto_send_health();
+    proto_mark_handled(s_proto_ack_id);
     return false;
   }
 
   // New transfer? Reset the reassembly buffer.
-  if (seq == 1) {
+  // v7.0.4: also reset when the id changes. The id identifies a transfer, so a
+  // different one means the previous transfer is dead (a chunk was lost and the
+  // phone gave up on it). Before this, the stale (expected, got) pair rejected
+  // every chunk of every later transfer, so no library could ever arrive again
+  // until the app restarted -- which looks exactly like "saving does nothing".
+  bool new_transfer = (seq == 1) ||
+                      s_proto_in_expected == 0 ||
+                      (uint16_t)total != s_proto_in_expected ||
+                      type != s_proto_in_type ||
+                      strcmp(s_proto_in_id, s_proto_in_id_current) != 0;
+
+  if (new_transfer) {
     s_proto_in_len      = 0;
     s_proto_in_expected = (uint16_t)total;
     s_proto_in_got      = 0;
     s_proto_in_type     = type;
+    snprintf(s_proto_in_id, sizeof(s_proto_in_id), "%s", s_proto_in_id_current);
     s_proto_in_buf[0]   = '\0';
-  } else if (s_proto_in_expected != (uint16_t)total ||
-             s_proto_in_type != type ||
-             s_proto_in_got != (uint16_t)(seq - 1)) {
+  }
+
+  if (seq != 1 && s_proto_in_got != (uint16_t)(seq - 1)) {
     // Out of sequence, or a retried duplicate of a chunk we already have.
     // Rejecting keeps a retransmit from corrupting the reassembled body.
+    // The sender ACKs per chunk, so it will resend; remember that this chunk
+    // was seen so its retransmit is answered instead of silently dropped.
+    proto_mark_handled(s_proto_ack_id);
     return false;
   }
 
   size_t chunk_len = strlen(body);
   if (s_proto_in_len + (int)chunk_len >= (int)sizeof(s_proto_in_buf)) {
-    return false;   // refuse rather than truncate
+    // Refuse rather than truncate, but answer: leaving it un-ACKed would stall
+    // the phone's queue for every transfer that follows.
+    proto_mark_handled(s_proto_ack_id);
+    return false;
   }
 
   memcpy(s_proto_in_buf + s_proto_in_len, body, chunk_len);
@@ -4670,7 +4976,14 @@ static bool proto_handle_envelope(const char *msg) {
     char completed_type = s_proto_in_type;
     s_proto_in_expected = 0;
     s_proto_in_got      = 0;
-    proto_dispatch(completed_type, s_proto_in_buf);
+    // v7.0.5: a body we could not apply must NOT be reported as received.
+    // Acknowledging it is what made "Save & Send" look successful while the
+    // watch silently kept the old routines; the phone now sees the failure, says
+    // so, and resends the library on the next connect.
+    if (!proto_dispatch(completed_type, s_proto_in_buf)) {
+      APP_LOG(0, "lib sync: body rejected, not acknowledging");
+      return false;
+    }
   }
   return true;
 }
@@ -4688,12 +5001,22 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
   // ---------- v8 envelope ----------
   Tuple *proto_tuple = dict_find(iterator, MESSAGE_KEY_PROTO_MESSAGE);
   if (proto_tuple && proto_tuple->type == TUPLE_CSTRING) {
-    // Every chunk we accept is ACKed immediately, including the ones that only
-    // fill the reassembly buffer: receipt is all the ACK has ever meant, and
-    // acknowledging per chunk is what lets the phone bound its outbox. Apply
-    // decisions are made locally on the completed body (see proto_dispatch).
-    if (proto_handle_envelope(proto_tuple->value->cstring)) {
-      proto_send_ack(s_proto_in_id);
+    const char *msg = proto_tuple->value->cstring;
+
+    // A retransmit of a chunk we already took a decision on gets its ACK again
+    // and nothing else. Without this the phone's success callback never fires,
+    // so its queue stops there and no later library can be sent at all.
+    s_proto_ack_id[0] = '\0';
+    if (proto_handle_envelope(msg)) {
+      // Every chunk we accept is ACKed immediately, including the ones that only
+      // fill the reassembly buffer: receipt is all the ACK has ever meant, and
+      // acknowledging per chunk is what lets the phone bound its outbox. Apply
+      // decisions are made locally on the completed body (see proto_dispatch).
+      // The id is the one from THIS envelope (s_proto_ack_id): s_proto_in_id can
+      // already have been overwritten by a rejected chunk.
+      proto_send_ack(s_proto_ack_id);
+    } else if (proto_was_handled(s_proto_ack_id)) {
+      proto_send_ack(s_proto_ack_id);
     }
     return;
   }

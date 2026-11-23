@@ -121,7 +121,16 @@ var protoOut = {
   id: '0',
   total: 0,
   retries: 0,
-  onDone: null
+  onDone: null,
+  // v7.0.4: transfers currently in flight. A transfer that never completes
+  // (the watch went out of range mid-library) used to leave this non-zero
+  // forever, so protoSendNext() ignored every later chunk and every Save after
+  // that did nothing until the phone app was restarted.
+  pending: 0,
+  // Watchdog: if a transfer has not finished after this long, abandon it so
+  // the next one may start. Real transfers take well under a second.
+  watchdog: null,
+  WATCHDOG_MS: 15000
 };
 
 var protoIn = {
@@ -156,6 +165,16 @@ function protoSend(type, body, onDone) {
     return;
   }
 
+  // v7.0.4: log when a previous transfer is still running and replace it. It
+  // used to be a silent no-op, which is why a second Save could do nothing.
+  if (protoOut.pending > 0) {
+    console.log('PROTO: replacing unfinished transfer ' + protoOut.id +
+                ' (' + protoOut.index + '/' + protoOut.total + ') with a new one');
+    protoOutClearWatchdog();
+    protoOut.pending = 0;
+    protoOut.onDone = null;
+  }
+
   var id = protoNextId();
   protoOut.queue = [];
   for (var i = 0; i < total; i++) {
@@ -169,15 +188,46 @@ function protoSend(type, body, onDone) {
   protoOut.total   = total;
   protoOut.retries = 0;
   protoOut.onDone  = onDone || null;
+  protoOut.pending = 1;
+  protoOutClearWatchdog();
+  protoOut.watchdog = setTimeout(protoOutOnWatchdog, protoOut.WATCHDOG_MS);
   protoSendNext();
 }
 
+// End the current transfer and fire its completion callback exactly once.
+function protoOutFinish(failed) {
+  protoOutClearWatchdog();
+  protoOut.pending = 0;
+  var done = protoOut.onDone;
+  protoOut.onDone = null;
+  if (done) done(failed);
+}
+
+function protoOutClearWatchdog() {
+  if (protoOut.watchdog) {
+    clearTimeout(protoOut.watchdog);
+    protoOut.watchdog = null;
+  }
+}
+
+// A transfer that never completed (watch out of range, phone app suspended
+// mid-library). Give up so the next Save is not blocked: the sequence numbers
+// still disagree, so HELLO on the next connect sends the library again.
+function protoOutOnWatchdog() {
+  protoOut.watchdog = null;
+  if (protoOut.pending === 0) return;
+  console.log('PROTO: transfer ' + protoOut.id + ' timed out at chunk ' +
+              protoOut.index + '/' + protoOut.total + ', giving up');
+  protoOut.index = protoOut.queue.length;   // stop the chain
+  protoOutFinish(true);
+}
+
 function protoSendNext() {
+  if (protoOut.pending === 0) return;       // this transfer was abandoned
+
   if (protoOut.index >= protoOut.queue.length) {
     console.log('PROTO: sent ' + protoOut.total + ' chunk(s) for ' + protoOut.id);
-    var done = protoOut.onDone;
-    protoOut.onDone = null;
-    if (done) done(false);
+    protoOutFinish(false);
     return;
   }
 
@@ -187,6 +237,21 @@ function protoSendNext() {
     protoOut.index++;
     protoSendNext();
   }, function(err) {
+    // Only retry chunks of the transfer that is still current.
+    if (protoOut.pending === 0) return;
+
+    // v7.0.5: the watch NACKs a body it could not apply (it used to ACK it and
+    // silently keep the old routines). A resend cannot fix a malformed body, so
+    // retrying 3x is pointless; report it once and let the next connect retry.
+    if (err && err.data && err.data.nack) {
+      console.log('PROTO: watch rejected the library body for ' + protoOut.id +
+                  ' (reason ' + (err.data.reason || 'unknown') + ')');
+      protoOut.index = protoOut.queue.length;
+      protoNotify('Watch could not take the routines.', true);
+      protoOutFinish(true);
+      return;
+    }
+
     if (protoOut.retries < PROTO_MAX_RETRIES) {
       protoOut.retries++;
       console.log('PROTO: chunk retry ' + protoOut.retries + ' for ' + protoOut.id);
@@ -197,10 +262,9 @@ function protoSendNext() {
     // the next connect (or the next save) sends the whole library again — a
     // failure is never silent, but it is also never fatal.
     console.log('PROTO: chunk failed permanently for ' + protoOut.id + ': ' + JSON.stringify(err));
-    var done = protoOut.onDone;
-    protoOut.onDone = null;
+    protoOut.index = protoOut.queue.length;
     protoNotify('Sync failed.\nWill retry.', true);
-    if (done) done(true);
+    protoOutFinish(true);
   });
 }
 
@@ -294,6 +358,7 @@ Pebble.addEventListener('showConfiguration', function() {
                         'history='   + encodeURIComponent(JSON.stringify(historyArr)),
                         'sync='      + encodeURIComponent(syncedRoutines)
     ];
+    if (diagModeEnabled()) params.push('diag=1');
     url = baseUrl + '?' + params.join('&');
 
     if (url.length <= SAFE_URL_LIMIT) break;  // fits — send it
@@ -319,6 +384,21 @@ Pebble.addEventListener('showConfiguration', function() {
   console.log('Opening config page. Final URL length: ' + url.length);
   Pebble.openURL(url);
 });
+
+// Beta diagnostic: whether to open the config page in close-URL probe mode.
+//
+// The flag lives in the phone app's own localStorage so it survives restarts.
+// It has to be toggled from outside the page (the page cannot write pkjs's
+// storage), so a tiny app message does it: send {"DIAG":1} to switch the probe
+// on for the next Settings open, {"DIAG":0} to switch it off. The watch does
+// not implement DIAG; only pkjs reads it, so nothing changes on the C side.
+function diagModeEnabled() {
+  try {
+    return Storage.get('diagMode', '0') === '1';
+  } catch (e) {
+    return false;
+  }
+}
 
 // 3. Configuration web page closed
 Pebble.addEventListener('webviewclosed', function(e) {
@@ -376,16 +456,29 @@ Pebble.addEventListener('webviewclosed', function(e) {
     );
   }
 
-  // --- Routines ---
-  // The page has already written the edited routine into 'savedRoutines' (which
-  // is what it renders from), so pkjs can read the library straight out of its
-  // own storage. Nothing has to travel through the pebblejs://close# URL, and
-  // nothing has to be parked by the webview either — the webview and pkjs do
-  // not share storage, which is why the old 'pendingRoutine' hand-off silently
-  // did nothing at all.
-  if (configData.libraryChanged) {
-    syncMarkEpoch();                       // a Save always reaches the watch
-    syncLibrary('config page saved');
+  // --- Routines: one command, one routine ---
+  // The webview and pkjs have SEPARATE localStorage, so the page cannot write
+  // the library here; the routine has to arrive in this response. That is the
+  // whole reason the old design failed, and why these commands exist.
+  //
+  //   save   : add the routine to this phone's library, then upsert it on the
+  //            watch by name (replace exercises, or add a new routine). Other
+  //            routines on the watch are not touched.
+  //   delete : remove the routine from this phone's library and delete it from
+  //            the watch by name.
+  //
+  // Deleting ON THE WATCH is the opposite direction and is handled by the watch
+  // alone: it leaves this library untouched, by design.
+  if (configData.cmd === 'save' && configData.name && configData.routine) {
+    saveRoutineLocally(configData.name, configData.routine);
+    sendRoutineUpsert(configData.name, configData.routine);
+  } else if (configData.cmd === 'delete' && configData.name) {
+    deleteRoutineLocally(configData.name);
+    sendRoutineDelete(configData.name);
+  } else if (configData.libraryChanged) {
+    // Backwards compatibility with an older index page that still asks for a
+    // whole-library push. New pages never send this.
+    syncLibrary('config page saved', true);
   }
 });
 
@@ -482,8 +575,18 @@ function syncInt(key, fallback) {
   return isNaN(n) ? fallback : n;
 }
 
+// A new library generation.
+//
+// v7.0.4: the epoch is derived from the clock, not from a local counter. A
+// counter that only ever ticks up from whatever the phone has stored can tie
+// with, or lose to, the epoch a previous install already pushed to the watch --
+// and then the watch is entitled to refuse the library as "already applied"
+// while the phone believes it sent something new. Minutes since 2024 are unique
+// across reinstalls and app upgrades and stay far below 2^31.
 function syncMarkEpoch() {
-  Storage.set('libraryEpoch', String(syncInt('libraryEpoch', 0) + 1));
+  var clockEpoch = Math.floor((new Date().getTime() - 1704067200000) / 60000); // 2024-01-01
+  var stored = syncInt('libraryEpoch', 0);
+  Storage.set('libraryEpoch', String(Math.max(clockEpoch, stored + 1)));
 }
 
 // Build the 'T' body:
@@ -493,7 +596,25 @@ function syncMarkEpoch() {
 // Working the boundary out from the fields alone is ambiguous, because an
 // exercise's own sets/reps/weight fields line up with exercise boundaries.
 // The leading 'T' keeps the body from being mistaken for an envelope header,
-// and <len> is the character length of everything after it.
+// and <len> is the length of everything after it **in UTF-8 bytes**.
+//
+// It must be bytes, not String.length: the watch compares it with strlen(), and
+// JavaScript counts UTF-16 units. A single accented letter, em dash or
+// non-breaking space (easily pasted in from a web page) made every library look
+// "truncated" to the watch and it was discarded even though it had arrived
+// intact -- see utf8Length().
+function utf8Length(str) {
+  var n = 0;
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xD800 && c <= 0xDBFF) { n += 4; i++; }  // surrogate pair
+    else n += 3;
+  }
+  return n;
+}
+
 function buildLibraryBody() {
   var routines = Storage.getJSON('savedRoutines', []);
   var parts = [];
@@ -513,15 +634,86 @@ function buildLibraryBody() {
   var seq   = syncInt('librarySeq', 0) + 1;
   var epoch = syncInt('libraryEpoch', 0);
   Storage.set('librarySeq', String(seq));
-  return 'T|' + seq + '|' + epoch + '|' + library.length + '|' + library;
+  return 'T|' + seq + '|' + epoch + '|' + utf8Length(library) + '|' + library;
 }
 
 // Send the whole library. `reason` is only for the log.
-function syncLibrary(reason) {
+//
+// v7.0.4: `bumpEpoch` marks this library as a new generation. The watch applies
+// a same-sequence transfer only if its epoch is newer, so every deliberate save
+// bumps it. Doing it here (rather than in webviewclosed) also covers the resend
+// caused by a HELLO mismatch, which never touches the config page.
+function syncLibrary(reason, bumpEpoch) {
+  if (bumpEpoch) syncMarkEpoch();
   var body = buildLibraryBody();
   console.log('SYNC: sending library (' + reason + '), ' + body.length + ' chars');
   protoSend('T', body, function(failed) {
     if (!failed) console.log('SYNC: library handed to the phone app');
+  });
+}
+
+// ------------------------------------------------------------
+// PER-ROUTINE LIBRARY OPERATIONS (v9)
+// ------------------------------------------------------------
+// The phone keeps its own copy of every routine the user has sent, in
+// localStorage, purely so HELLO can repair the watch and so the config page can
+// be handed the list. Each routine is stored as the serialised string the watch
+// understands, so there is exactly one format in the system.
+//
+//   savedRoutines : [ "Name|Ex|sets|reps|weight|mod|note|...", ... ]
+//
+// A routine is identified by its NAME, which is what makes "send the same name
+// again" replace the exercises instead of creating a duplicate.
+
+// Add or replace one routine in this phone's copy.
+function saveRoutineLocally(name, routineStr) {
+  var routines = Storage.getJSON('savedRoutines', []);
+  var replaced = false;
+
+  for (var i = 0; i < routines.length; i++) {
+    var r = routines[i];
+    var rname = (r && typeof r === 'object') ? r.name : String(r).split('|')[0];
+    if (rname === name) { routines[i] = routineStr; replaced = true; break; }
+  }
+  if (!replaced) routines.push(routineStr);
+
+  Storage.setJSON('savedRoutines', routines);
+  console.log('LIB: ' + (replaced ? 'replaced' : 'added') + ' "' + name +
+              '" (' + routines.length + ' routine(s) on the phone)');
+}
+
+// Remove one routine from this phone's copy.
+function deleteRoutineLocally(name) {
+  var routines = Storage.getJSON('savedRoutines', []);
+  var kept = [];
+
+  for (var i = 0; i < routines.length; i++) {
+    var r = routines[i];
+    var rname = (r && typeof r === 'object') ? r.name : String(r).split('|')[0];
+    if (rname !== name) kept.push(r);
+  }
+
+  Storage.setJSON('savedRoutines', kept);
+  console.log('LIB: deleted "' + name + '" (' + kept.length + ' routine(s) on the phone)');
+}
+
+// Send one routine to the watch: 'U' = upsert by name.
+function sendRoutineUpsert(name, routineStr) {
+  // The watch wants "<exercise count>|<name>|<exercises>", which is exactly the
+  // count the serialised routine already starts with, so no reshaping is needed
+  // beyond making sure the count is present.
+  var body = routineStr;
+  console.log('SYNC: upsert "' + name + '" (' + body.length + ' chars)');
+  protoSend('U', body, function (failed) {
+    if (!failed) console.log('SYNC: routine "' + name + '" sent');
+  });
+}
+
+// Delete one routine on the watch: 'D' = delete by name.
+function sendRoutineDelete(name) {
+  console.log('SYNC: delete "' + name + '"');
+  protoSend('D', name, function (failed) {
+    if (!failed) console.log('SYNC: delete of "' + name + '" sent');
   });
 }
 
@@ -533,7 +725,10 @@ function sendHello(forceLibrary) {
     SYNC_EPOCH:    syncInt('libraryEpoch', 0)
   };
   Pebble.sendAppMessage(msg, function() {
-    if (forceLibrary) syncLibrary('hello');
+    // forceLibrary is the "send it regardless" case, so this one is a new
+    // generation too: the watch only honours a same-sequence transfer whose
+    // epoch is newer than the one it has applied.
+    if (forceLibrary) syncLibrary('hello', true);
   }, function(err) {
     console.log('SYNC: hello failed: ' + JSON.stringify(err));
   });
@@ -576,7 +771,9 @@ Pebble.addEventListener('appmessage', function(e) {
     }
 
     if (watchSeq !== mySeq || watchEpoch !== myEpoch) {
-      syncLibrary('watch is behind');
+      // A new generation: if the watch already applied this very sequence with a
+      // lower epoch (a phone whose storage was rebuilt), it is still honoured.
+      syncLibrary('watch is behind', true);
     }
     // Anything else from the watch (the report is already in flight).
     return;
@@ -602,6 +799,15 @@ Pebble.addEventListener('appmessage', function(e) {
   // --- the watch received something we sent ---
   if (payload.PROTO_ACK) {
     console.log('PROTO: watch acknowledged ' + payload.PROTO_ACK);
+    return;
+  }
+
+  // --- Beta diagnostic toggle: {"DIAG":1} / {"DIAG":0} ---
+  // Lets the close-URL probe be switched on without rebuilding the app.
+  if (payload.DIAG !== undefined) {
+    Storage.set('diagMode', payload.DIAG ? '1' : '0');
+    console.log('DIAG mode ' + (payload.DIAG ? 'ON' : 'OFF') +
+                ' - open Settings to use the close-URL probe');
     return;
   }
 
