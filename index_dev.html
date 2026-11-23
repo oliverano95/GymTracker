@@ -142,6 +142,25 @@
     <button class="tab-btn"        onclick="switchTab(event,'tab-history-cloud')">☁️ History</button>
 </div>
 
+<!-- ════════════ DIAGNOSTIC: URL CLOSE LIMIT (beta only) ════════════ -->
+<!-- Shown only with ?diag=1 (or when pkjs opens the page with diag=1). It
+     closes the webview with a payload of a chosen byte length so the real
+     truncation point of pebblejs://close# can be measured on the device:
+       pebble logs --phone <ip>  ->  "webviewclosed: raw response length = N"
+     If N matches what was sent, that size delivered intact. -->
+<div id="tab-diag" class="tab-content" style="display:none;">
+    <div class="card">
+        <h3 style="margin-top:0;">Close-URL size probe</h3>
+        <p style="font-size:12px;color:gray;margin-top:0;">
+            Each button closes the page with a payload of that many characters.
+            Check the <code>webviewclosed: raw response length</code> line in
+            <code>pebble logs</code>: if the number matches, that size arrives intact.
+        </p>
+        <div id="diagButtons" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+        <p id="diagLast" style="font-size:12px;color:gray;"></p>
+    </div>
+</div>
+
 <!-- ════════════ TAB: BUILDER ════════════ -->
 <div id="tab-builder" class="tab-content active">
     <div class="card">
@@ -1517,6 +1536,11 @@ window.addEventListener('load', () => {
     updateProgressionUI();
     loadSavedRoutines();
 
+    // Beta diagnostic (?diag=1): replaces the builder with the close-URL size
+    // probe. Returns early from nothing — it only toggles visibility, so normal
+    // behaviour is unchanged when the parameter is absent.
+    initDiagMode();
+
     // Show global action buttons (builder tab is default)
     document.getElementById('btn-send-single').style.display = 'block';
     document.getElementById('btn-send-google').style.display = 'none';
@@ -1642,6 +1666,62 @@ window.addEventListener('load', () => {
         }
     } catch {}
 });
+// ============================================================
+// CLOSE-URL SIZE PROBE  (beta diagnostic, only with ?diag=1)
+// ============================================================
+// The phone silently truncates the pebblejs://close# response somewhere between
+// ~279 characters (known to work) and ~672 (known to fail). Everything about
+// how routines can be delivered depends on where the real limit is, so rather
+// than guess we measure it: close with a payload of exactly N characters and
+// read "webviewclosed: raw response length = N" in pebble logs.
+//
+// The payload is pure ASCII so its encoded length equals its raw length and the
+// reported number can be compared directly with the requested size.
+function buildProbePayload(targetLen) {
+    // {"d":"xxx..."}  ->  JSON overhead is 8 characters: {"d":"..."} plus quotes
+    const overhead = JSON.stringify({ d: '' }).length;
+    const filler = 'A'.repeat(Math.max(0, targetLen - overhead));
+    const json = JSON.stringify({ d: filler });
+    return json;
+}
+
+function runCloseProbe(targetLen) {
+    const json = buildProbePayload(targetLen);
+    const encoded = encodeURIComponent(json);
+    const returnTo = getQueryParam('return_to', 'pebblejs://close#');
+
+    document.getElementById('diagLast').textContent =
+        'Closing with JSON ' + json.length + ' chars, encoded ' + encoded.length + ' chars…';
+
+    // Straight navigation, deliberately NOT going through sendToPebble(), so the
+    // MAX_CONFIG_RESPONSE guard cannot stop the very test that exists to find
+    // the real limit.
+    window.location.href = returnTo + encoded;
+}
+
+function initDiagMode() {
+    if (getQueryParam('diag', '') !== '1') return;
+
+    // Hide the normal builder, show the probe.
+    const builder = document.getElementById('tab-builder');
+    if (builder) builder.style.display = 'none';
+    const diag = document.getElementById('tab-diag');
+    if (diag) diag.style.display = 'block';
+
+    const host = document.getElementById('diagButtons');
+    const sizes = [100, 200, 279, 350, 400, 450, 500, 600, 672, 800, 1000, 1200, 1500, 2000];
+    sizes.forEach((n) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'small-btn';
+        b.textContent = n + ' chars';
+        b.onclick = () => runCloseProbe(n);
+        host.appendChild(b);
+    });
+
+    const note = document.getElementById('diagLast');
+    if (note) note.textContent = 'Pick a size. Then read the log line.';
+}
 </script>
 </body>
 </html>
