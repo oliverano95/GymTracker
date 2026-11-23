@@ -88,11 +88,14 @@ function saveWorkoutLocally(rawData) {
 }
 
 // ============================================================
-// WIRE PROTOCOL (v8)
+// WIRE PROTOCOL (v8 framing, v9 payloads)
 // '<VER>|<TYPE>|<id>|<seq>/<total>|<body>'
 //
 // What can cross the wire, in full:
-//   phone -> watch   PROTO_MESSAGE 'T'  the whole routine library (chunked)
+//   phone -> watch   PROTO_MESSAGE 'U'  ONE routine, upserted by name
+//                    PROTO_MESSAGE 'D'  ONE routine, deleted by name
+//                    PROTO_MESSAGE 'T'  the whole routine library (chunked);
+//                                       used by HELLO to repair the watch
 //                    PROGRESSION_MODE / WEIGHT_INCREMENT   two ints
 //                    SYNC_SEQUENCE / SYNC_EPOCH            HELLO (two ints)
 //   watch -> phone   PROTO_MESSAGE 'W'  one workout report (prefixed with the
@@ -100,10 +103,9 @@ function saveWorkoutLocally(rawData) {
 //                    PROTO_ACK           received chunk <id>
 //                    SYNC_SEQUENCE / SYNC_EPOCH  what the watch holds (HELLO)
 //
-// There is no staging, no batch envelope, no retransmit timer and no
-// tombstone list: the phone always sends the complete library, so the watch
-// can derive deletions by itself, and both sides hold one monotonically
-// increasing sequence number that says whether they agree.
+// A save sends one routine, a delete sends one name, and neither touches the
+// rest of the library on the watch. 'T' still exists for the one case that
+// needs every routine: a watch that has none (fresh install, factory reset).
 // ============================================================
 var PROTO = {
   VERSION: 2,
@@ -200,7 +202,53 @@ function protoOutFinish(failed) {
   protoOut.pending = 0;
   var done = protoOut.onDone;
   protoOut.onDone = null;
-  if (done) done(failed);
+  // Whatever the transfer asks for next (a HELLO after a delete, a settings
+  // message) is queued behind it, so it goes out on the wire in that order.
+  if (done) deferToWire(function () { done(failed); });
+}
+
+// ------------------------------------------------------------
+// WIRE QUEUE
+// ------------------------------------------------------------
+// One thing at a time: protoSend() cancels whatever is in flight, so two
+// messages sent back to back (the 'D' delete and the HELLO that follows it)
+// would otherwise race, and the order the watch sees decides whether the
+// phone hears back again.
+var wireQueue = [];
+var wireBusy  = false;
+var wireTimer = null;
+
+function deferToWire(fn) {
+  wireQueue.push(fn);
+  wirePump();
+}
+
+function wirePump() {
+  if (wireBusy || protoOut.pending > 0) return;
+  if (wireTimer) { clearTimeout(wireTimer); wireTimer = null; }
+  if (wireQueue.length === 0) return;
+
+  wireBusy = true;
+  var fn = wireQueue.shift();
+  try {
+    fn();
+  } catch (e) {
+    console.log('WIRE: queued step threw: ' + e);
+    wireBusy = false;
+    wirePump();
+    return;
+  }
+  wireBusy = false;
+
+  // A step that started a transfer is finished when that transfer is; the
+  // watchdog guarantees this is reached even when the watch stops answering.
+  if (protoOut.pending > 0) {
+    if (protoOut.watchdog) {
+      wireTimer = setTimeout(wirePump, protoOut.WATCHDOG_MS + 50);
+    }
+    return;
+  }
+  wirePump();
 }
 
 function protoOutClearWatchdog() {
@@ -342,7 +390,10 @@ Pebble.addEventListener('showConfiguration', function() {
 
   var googleUrl      = Storage.get('googleUrl', '');
   var googlePwd      = Storage.get('googlePwd', '');
-  var syncedRoutines = Storage.get('synced_routines', '{}');
+  // The library this phone holds, as routine definitions. The page lists the
+  // dropdown from this, compares a save against it, and checks a delete
+  // against it — so it is always the CURRENT library, never a cache.
+  var syncedRoutines = JSON.stringify(libraryRoutineDict());
   var historyArr     = Storage.getJSON('workoutHistory', []);
 
   var SAFE_URL_LIMIT = 7000; // GitHub Pages rejects URLs over ~8KB
@@ -436,9 +487,13 @@ Pebble.addEventListener('webviewclosed', function(e) {
     Storage.setJSON('workoutHistory', []);
   }
 
-  // --- Two-Way Sync routines ---
+  // --- Routines: the page may not overwrite the library wholesale ---
+  // The library is owned here, and the page only ever sends one named command
+  // (below). `updatedSync` is the old "here is my cached library" field: taking
+  // it would overwrite the real library with whatever that page had cached,
+  // which is how deleted routines came back.
   if (configData.updatedSync !== undefined) {
-    Storage.setJSON('synced_routines', configData.updatedSync);
+    console.log('webviewclosed: ignoring updatedSync (the phone owns the library)');
   }
 
   // --- Settings: two ints, their own message ---
@@ -463,18 +518,47 @@ Pebble.addEventListener('webviewclosed', function(e) {
   //
   //   save   : add the routine to this phone's library, then upsert it on the
   //            watch by name (replace exercises, or add a new routine). Other
-  //            routines on the watch are not touched.
+  //            routines on the watch are not touched. `renamedFrom` names the
+  //            routine this replaces, if the name was edited: it leaves the
+  //            library and is deleted on the watch.
   //   delete : remove the routine from this phone's library and delete it from
-  //            the watch by name.
+  //            the watch by name — but only if this phone actually held it.
   //
   // Deleting ON THE WATCH is the opposite direction and is handled by the watch
-  // alone: it leaves this library untouched, by design.
+  // alone: it leaves this library untouched, by design. The page says whether
+  // the routine was in this library (`wasOnPhone`), and that is the authority
+  // here: a routine deleted on the watch is not in this library, so a stale
+  // page can never ask for it to be deleted from here.
   if (configData.cmd === 'save' && configData.name && configData.routine) {
-    saveRoutineLocally(configData.name, configData.routine);
-    sendRoutineUpsert(configData.name, configData.routine);
+    var renamedFrom = (configData.renamedFrom && configData.renamedFrom !== configData.name)
+                      ? configData.renamedFrom : null;
+
+    saveRoutineLocally(configData.name, configData.saved || configData.routine);
+    if (renamedFrom && hasRoutineLocally(renamedFrom)) {
+      deleteRoutineLocally(renamedFrom);
+    }
+
+    // One routine changed; the rest of the library did not, so only the watch
+    // is told — by name, so nothing else on it can be touched. A rename is a
+    // create plus a delete of the old name, in that order (upsert first, so a
+    // failure leaves the user with the routine under both names rather than
+    // neither).
+    sendRoutineUpsert(configData.name, configData.routine,
+                      renamedFrom ? function () { sendRoutineDelete(renamedFrom); }
+                                  : null);
   } else if (configData.cmd === 'delete' && configData.name) {
-    deleteRoutineLocally(configData.name);
-    sendRoutineDelete(configData.name);
+    // This library is the authority: a routine deleted ON the watch is not in
+    // it, so a page that says "delete X" for a routine this phone never had
+    // must not reach the watch at all. `wasOnPhone` is only logged, because a
+    // page held open across a change can be out of date.
+    if (hasRoutineLocally(configData.name)) {
+      deleteRoutineLocally(configData.name);
+      sendRoutineDelete(configData.name);
+    } else {
+      console.log('LIB: "' + configData.name + '" was not on this phone (page said ' +
+                  (configData.wasOnPhone === false ? 'it was not' : 'it was') +
+                  '), nothing to delete');
+    }
   } else if (configData.libraryChanged) {
     // Backwards compatibility with an older index page that still asks for a
     // whole-library push. New pages never send this.
@@ -666,16 +750,22 @@ function syncLibrary(reason, bumpEpoch) {
 // again" replace the exercises instead of creating a duplicate.
 
 // Add or replace one routine in this phone's copy.
+//
+// The entry is the CANONICAL definition ("<name>|<exercise>|...", six fields per
+// exercise), never the config page's full form: the library is what the watch's
+// 'T' body and the page's 'sync' param are both built from, and the progression
+// header belongs to the per-routine settings, not here.
 function saveRoutineLocally(name, routineStr) {
   var routines = Storage.getJSON('savedRoutines', []);
   var replaced = false;
+  var entry = routineDefinition(name, routineStr);
 
   for (var i = 0; i < routines.length; i++) {
     var r = routines[i];
     var rname = (r && typeof r === 'object') ? r.name : String(r).split('|')[0];
-    if (rname === name) { routines[i] = routineStr; replaced = true; break; }
+    if (rname === name) { routines[i] = entry; replaced = true; break; }
   }
-  if (!replaced) routines.push(routineStr);
+  if (!replaced) routines.push(entry);
 
   Storage.setJSON('savedRoutines', routines);
   console.log('LIB: ' + (replaced ? 'replaced' : 'added') + ' "' + name +
@@ -697,15 +787,56 @@ function deleteRoutineLocally(name) {
   console.log('LIB: deleted "' + name + '" (' + kept.length + ' routine(s) on the phone)');
 }
 
-// Send one routine to the watch: 'U' = upsert by name.
-function sendRoutineUpsert(name, routineStr) {
-  // The watch wants "<exercise count>|<name>|<exercises>", which is exactly the
-  // count the serialised routine already starts with, so no reshaping is needed
-  // beyond making sure the count is present.
-  var body = routineStr;
+// Does this phone's library hold `name`?
+function hasRoutineLocally(name) {
+  var routines = Storage.getJSON('savedRoutines', []);
+  for (var i = 0; i < routines.length; i++) {
+    var r = routines[i];
+    var rname = (r && typeof r === 'object') ? r.name : String(r).split('|')[0];
+    if (rname === name) return true;
+  }
+  return false;
+}
+
+// The definition of one routine, exactly as the watch takes it:
+// "<name>|<exercise>|<sets>|<reps>|<weight>|<modifier>|<comment>|..."
+//
+// Entries are kept in that canonical form, so this is also what the config
+// page is given (the 'sync' URL param) and what it hands back on a save.
+// `routineStr` is accepted in either form: a definition, or a config page
+// routine carrying the "<name>|<prog>|<inc>|" header (which is dropped, because
+// progression travels in the settings ints and the watch counts fields six at a
+// time).
+function routineDefinition(name, routineStr) {
+  if (!name) return null;
+  var s = String(routineStr || '');
+  if (s.indexOf(name + '|') === 0 && isProgressedDefinition(s)) {
+    s = name + '|' + s.split('|').slice(3).join('|');
+  }
+  if (s.indexOf(name + '|') !== 0) s = s ? name + '|' + s : name + '|';
+  return s;
+}
+
+// True when the field after the name is a progression mode, i.e. the string
+// starts "<name>|<prog>|<inc>|<exercise>|...".
+function isProgressedDefinition(str) {
+  var parts = String(str).split('|');
+  return parts.length >= 3 && (parts[1] === '-1' || parts[1] === '0' || parts[1] === '1');
+}
+
+// Send one routine to the watch: 'U' = upsert by name. `then` runs after it is
+// in, on the wire's turn (a rename deletes the old name right after).
+function sendRoutineUpsert(name, routineStr, then) {
+  // "<name>|<exercise>|...", six fields per exercise, which is what the config
+  // page produces and what handle_routine_upsert() derives the exercise count
+  // from. No reshaping beyond making sure the name is in front.
+  var body = routineDefinition(name, routineStr) || name;
   console.log('SYNC: upsert "' + name + '" (' + body.length + ' chars)');
   protoSend('U', body, function (failed) {
-    if (!failed) console.log('SYNC: routine "' + name + '" sent');
+    if (failed) return;                  // the next connect retries
+    console.log('SYNC: routine "' + name + '" sent');
+    if (then) { then(); return; }        // a follow-up step announces itself
+    announceApplied();
   });
 }
 
@@ -713,13 +844,35 @@ function sendRoutineUpsert(name, routineStr) {
 function sendRoutineDelete(name) {
   console.log('SYNC: delete "' + name + '"');
   protoSend('D', name, function (failed) {
-    if (!failed) console.log('SYNC: delete of "' + name + '" sent');
+    if (failed) return;                  // the next connect retries
+    console.log('SYNC: delete of "' + name + '" sent');
+    announceApplied();
   });
+}
+
+// The watch has taken the change: advance the library numbers and tell it.
+//
+// This MUST happen after the transfer completes, never before. The numbers say
+// "this is the state I am at", so they may only move once the watch is at that
+// state too — announcing them first makes HELLO disagree with a watch that has
+// not applied the change yet, and the watch asks for the whole library back.
+// Bumping them here is what makes the HELLO agree, so a save or a delete is
+// not followed by a 'T' that would undo it.
+function announceApplied() {
+  syncMarkChanged();
+  sendHelloNow(false);
 }
 
 // HELLO: tell the watch what this phone has, and ask what it holds.
 // The watch answers with its own (seq, epoch); whichever side is behind sends.
+//
+// It is queued behind any transfer in flight, so a HELLO that follows a delete
+// goes out after the delete rather than cancelling it.
 function sendHello(forceLibrary) {
+  deferToWire(function () { sendHelloNow(forceLibrary); });
+}
+
+function sendHelloNow(forceLibrary) {
   var msg = {
     SYNC_SEQUENCE: syncInt('librarySeq', 0),
     SYNC_EPOCH:    syncInt('libraryEpoch', 0)
@@ -732,6 +885,52 @@ function sendHello(forceLibrary) {
   }, function(err) {
     console.log('SYNC: hello failed: ' + JSON.stringify(err));
   });
+}
+
+// Announce the library to the watch after a change, WITHOUT sending routines.
+//
+// Sequence and epoch are monotonic bookkeeping: they say which state this phone
+// is at, not how it got there. A save or a delete has already told the watch
+// exactly what changed, so bumping them here means the HELLO that follows
+// agrees with the watch and no whole-library 'T' is triggered — which would
+// undo the delete (a 'T' coming from a stale library is how a deleted routine
+// ends up on the watch again). A mismatch still repairs a watch that was out of
+// range, because that HELLO carries numbers the watch has not applied.
+function syncMarkChanged() {
+  var seq = syncInt('librarySeq', 0) + 1;
+  Storage.set('librarySeq', String(seq));
+  syncMarkEpoch();
+}
+
+// Every routine in this phone's library, in the shape the watch's 'T' body and
+// the config page's 'sync' param share: { name: "<name>|<exercise>|..." }.
+//
+// An entry is a definition string; an object entry (a page that stored a
+// routine object before v9) has its exercises read out of it instead.
+function libraryRoutineDict() {
+  var routines = Storage.getJSON('savedRoutines', []);
+  var dict = {};
+  for (var i = 0; i < routines.length; i++) {
+    var r = routines[i];
+    if (!r) continue;
+
+    if (typeof r === 'object') {
+      if (!r.name) continue;
+      var ex = [];
+      for (var e = 0; e < (r.exercises || []).length; e++) {
+        var x = r.exercises[e];
+        var note = (x[5] !== undefined && String(x[5]).trim() !== '') ? String(x[5]).trim() : '-';
+        ex.push([x[0], x[1], x[2], x[3], (x[4] === undefined ? 0 : x[4]), note].join('|'));
+      }
+      dict[r.name] = r.name + '|' + ex.join('|');
+      continue;
+    }
+
+    var name = String(r).split('|')[0];
+    if (!name) continue;
+    dict[name] = routineDefinition(name, r);
+  }
+  return dict;
 }
 
 // ============================================================

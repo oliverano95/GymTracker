@@ -19,12 +19,89 @@ const SOURCE = fs.readFileSync(PKJS, 'utf8');
 const PROTO = { VERSION: 2, CHUNK: 512, MAX_CHUNKS: 8 };
 
 // The watch, modelled on proto_handle_envelope() / handle_library_sync().
+//
+// The contract the phone app relies on: by the time a transfer's success
+// callback runs, the watch has APPLIED it. That is what lets the phone app bump
+// its library numbers in that callback and have its HELLO agree with the watch
+// (see announceApplied() in src/pkjs/index.js).
 function makeWatch(seq = 0, epoch = 0) {
   return {
     seq, epoch,
     stored: {},          // routine name -> applied payload
-    rx: { id: '0', expected: 0, got: 0, type: '', buf: '' },
-    events: [],          // 'apply' | 'stale' | 'ack'
+    rx: { id: '0', expected: 0, type: '', got: 0, buf: '' },
+    events: [],          // 'ack' | 'upsert' | 'delete' | 'apply' | 'stale'
+    // The watch answering a HELLO (proto_send_hello): it records the state the
+    // phone says it is at, then answers with the state the watch holds. A 'U'
+    // or 'D' carries no numbers of its own, so this HELLO is where the watch
+    // learns them (SYNC_SEQ_PHONE_KEY/SYNC_EPOCH_ACK_KEY on real hardware).
+    // `reply` is installed by loadPkjs once the phone app's listener exists.
+    reply: null,
+    hello(phoneSeq, phoneEpoch) {
+      if (phoneSeq !== undefined && phoneEpoch !== undefined &&
+          (phoneSeq > this.seq || (phoneSeq === this.seq && phoneEpoch > this.epoch))) {
+        this.seq = phoneSeq;
+        this.epoch = phoneEpoch;
+      }
+      if (!this.reply) return;
+      this.reply({ SYNC_SEQUENCE: this.seq, SYNC_EPOCH: this.epoch,
+                   SYNC_FLAGS: Object.keys(this.stored).length > 7 ? 1 : 0 });
+    },
+    // The watch deleting a routine on its own (the user did it on the watch).
+    deleteOnWatch(name) { delete this.stored[name]; },
+
+    // proto_dispatch: 'U' upserts one routine, 'D' deletes one by name, 'T' is
+    // the whole library.
+    //
+    // A 'T' carries its own seq/epoch. A 'U' or 'D' does not — the phone app
+    // announces the new numbers in the HELLO that follows, and the watch records
+    // them then (a real watch stores SYNC_SEQ_PHONE_KEY/SYNC_EPOCH_ACK_KEY).
+    applyTransfer(type, body) {
+      if (type === 'U') {
+        this.events.push('upsert');
+        this.stored[body.split('|')[0]] = body;
+        return;
+      }
+      if (type === 'D') {
+        this.events.push('delete');
+        delete this.stored[body];
+        return;
+      }
+      if (type !== 'T') return;
+      this.applyLibrary(body);
+    },
+
+    applyLibrary(body) {
+      const h = body.split('|');
+      const lseq = parseInt(h[1], 10), lepoch = parseInt(h[2], 10);
+      if (lseq !== 0 && lseq <= this.seq && !(lseq === this.seq && lepoch > this.epoch)) {
+        this.events.push('stale');
+        this.seq = lseq;                    // v7.0.4: the record still advances
+        return;
+      }
+      const routines = {};
+      const lib = h.slice(4).join('|');
+      let cur = 0;
+      while (cur < lib.length) {
+        const bar = lib.indexOf('|', cur);
+        if (bar < 0) break;
+        const n = parseInt(lib.slice(cur, bar), 10);
+        const nameEnd = lib.indexOf('|', bar + 1);
+        const name = lib.slice(bar + 1, nameEnd);
+        let end = nameEnd;
+        for (let f = 0; f < n * 6; f++) {
+          end++;                                        // over the delimiter
+          while (end < lib.length && lib[end] !== '|') end++;
+        }
+        routines[name] = lib.slice(bar + 1, end);
+        if (end >= lib.length) break;
+        cur = end + 1;
+      }
+      // Make before break: whatever is not in the new library is deleted.
+      Object.keys(this.stored).forEach((k) => { if (!(k in routines)) delete this.stored[k]; });
+      Object.assign(this.stored, routines);
+      this.seq = lseq; this.epoch = lepoch;
+      this.events.push('apply');
+    },
   };
 }
 
@@ -36,54 +113,35 @@ function watchReceive(w, env) {
   const body = parts.slice(4).join('|');
   const rx = w.rx;
 
+  // The watch ACKs the chunk immediately: receipt is all the ACK has ever meant.
+  w.events.push('ack');
+
   if (parseInt(parts[0], 10) > PROTO.VERSION) return;
-  if (!(total >= 1 && seq >= 1 && seq <= total && total <= PROTO.MAX_CHUNKS)) {
-    w.events.push('ack'); return;
-  }
+  if (!(total >= 1 && seq >= 1 && seq <= total && total <= PROTO.MAX_CHUNKS)) return;
+
   const newTransfer = seq === 1 || rx.expected === 0 || total !== rx.expected ||
                       type !== rx.type || rx.id !== id;
   if (newTransfer) { rx.id = id; rx.type = type; rx.expected = total; rx.got = 0; rx.buf = ''; }
-  if (seq !== 1 && rx.got !== seq - 1) { w.events.push('ack'); return; }
+  if (seq !== 1 && rx.got !== seq - 1) return;
 
   rx.buf += body; rx.got++;
-  if (rx.got < rx.expected) { w.events.push('ack'); return; }
+  if (rx.got < rx.expected) return;
   rx.expected = 0; rx.got = 0;
-  w.events.push('ack');
 
-  // proto_dispatch -> handle_library_sync
-  const h = rx.buf.split('|');
-  const lseq = parseInt(h[1], 10), lepoch = parseInt(h[2], 10);
-  if (lseq !== 0 && lseq <= w.seq && !(lseq === w.seq && lepoch > w.epoch)) {
-    w.events.push('stale');
-    w.seq = lseq;                    // v7.0.4: the record still advances
-    return;
-  }
-  const routines = {};
-  const lib = h.slice(4).join('|');
-  let cur = 0;
-  while (cur < lib.length) {
-    const bar = lib.indexOf('|', cur);
-    if (bar < 0) break;
-    const n = parseInt(lib.slice(cur, bar), 10);
-    const nameEnd = lib.indexOf('|', bar + 1);
-    const name = lib.slice(bar + 1, nameEnd);
-    let end = nameEnd;
-    for (let f = 0; f < n * 6; f++) {
-      end++;                                        // over the delimiter
-      while (end < lib.length && lib[end] !== '|') end++;
-    }
-    routines[name] = lib.slice(bar + 1, end);
-    if (end >= lib.length) break;
-    cur = end + 1;
-  }
-  Object.keys(w.stored).forEach((k) => { if (!(k in routines)) delete w.stored[k]; });
-  Object.assign(w.stored, routines);
-  w.seq = lseq; w.epoch = lepoch;
-  w.events.push('apply');
+  // APPLY, synchronously, before the phone's success callback is scheduled. This
+  // is what the transfer model has always assumed (see the v9 tests: "a save
+  // sends a single U envelope"), and it is the ordering that matters here: by
+  // the time the phone app says anything else, the watch has the change.
+  w.applyTransfer(type, rx.buf);
 }
+
 // Load the real pkjs with a stub environment.
 // `dropFirst` drops that many outbound chunks without answering them, which is
 // how a real Bluetooth hiccup looks to the phone app.
+//
+// A watch ACKs a chunk as soon as it has it and has applied it; the reply to a
+// HELLO quotes what it holds. Both happen before the phone app's callback, which
+// is the ordering the phone app's bookkeeping depends on.
 function loadPkjs(store, watch, opts) {
   const drop = { left: (opts && opts.dropFirst) || 0 };
   const log = [];
@@ -115,10 +173,18 @@ function loadPkjs(store, watch, opts) {
         setTimeout(() => (answered ? (ok && ok()) : (fail && fail({ error: 'nack' }))), 0);
         return;
       }
+      if (msg.SYNC_SEQUENCE !== undefined && watch) {
+        // HELLO: the watch answers with what it holds (proto_send_hello).
+        setTimeout(() => {
+          if (ok) ok();
+          setTimeout(() => watch.hello(msg.SYNC_SEQUENCE, msg.SYNC_EPOCH), 0);
+        }, 0);
+        return;
+      }
       setTimeout(() => ok && ok(), 0);
     },
     showSimpleNotificationOnPebble(title, body) { ui.notifications.push(title + ': ' + body); },
-    openURL() {},
+    openURL(url) { ui.openedUrl = url; },
   };
 
   const sandbox = {
@@ -126,16 +192,23 @@ function loadPkjs(store, watch, opts) {
     localStorage, Pebble,
     setTimeout, clearTimeout, setInterval, clearInterval,
     XMLHttpRequest: function () { this.open = () => {}; this.send = () => {}; },
-    JSON, Math, Date, parseInt, isNaN, String, Object, Array,
+    JSON, Math, Date, parseInt, isNaN, String, Object, Array, Set, Map,
   };
   vm.createContext(sandbox);
   vm.runInContext(SOURCE, sandbox, { filename: 'pkjs/index.js' });
 
+  const watchInbound = (payload) => {
+    listeners.appmessage && listeners.appmessage({ payload });
+  };
+  if (watch) watch.reply = watchInbound;
+
   return {
-    ui, log, listeners,
+    ui, log, listeners, watchInbound,
     ready() { listeners.ready && listeners.ready(); },
     close(response) { listeners.webviewclosed && listeners.webviewclosed({ response: JSON.stringify(response) }); },
     flush() { return new Promise((r) => setTimeout(r, 40)); },
+    // Let the wire (chunks, ACKs and the HELLO that follows a change) settle.
+    settle() { return new Promise((r) => setTimeout(r, 120)); },
     // Run the transfer watchdog now instead of waiting 15 s for it.
     watchdog() { sandbox.protoOutOnWatchdog(); },
   };
@@ -281,12 +354,15 @@ function envelopeBody(env) {
 test.describe('pkjs per-routine commands (v9)', () => {
   test('cmd:save sends a single U envelope naming that routine', async () => {
     const store = { savedRoutines: '[]' };
-    const app = loadPkjs(store, makeWatch(0, 0));
+    const w = makeWatch(0, 0);
+    w.stored = {};                       // the watch agrees, so nothing is re-sent
+    const app = loadPkjs(store, w);
 
     app.close({ cmd: 'save', name: 'New', routine: 'New|Squat|3|10|150|0|-' });
-    await app.flush(); await app.flush();
+    await app.settle();
 
     const envs = sentEnvelopes(app);
+    console.log('DBG log', JSON.stringify(app.log));
     expect(envs).toHaveLength(1);
     expect(envelopeType(envs[0])).toBe('U');
     expect(envelopeBody(envs[0])).toBe('New|Squat|3|10|150|0|-');
@@ -315,10 +391,12 @@ test.describe('pkjs per-routine commands (v9)', () => {
 
   test('cmd:delete sends a single D envelope with just the name', async () => {
     const store = { savedRoutines: JSON.stringify(['New|Squat|3|10|150|0|-']) };
-    const app = loadPkjs(store, makeWatch(0, 0));
+    const w = makeWatch(0, 0);
+    w.stored = {};                       // already gone from the watch
+    const app = loadPkjs(store, w);
 
     app.close({ cmd: 'delete', name: 'New' });
-    await app.flush(); await app.flush();
+    await app.settle();
 
     const envs = sentEnvelopes(app);
     expect(envs).toHaveLength(1);
@@ -343,14 +421,115 @@ test.describe('pkjs per-routine commands (v9)', () => {
 
   test('a save does not send a whole library (no T envelope)', async () => {
     const store = { savedRoutines: '[]' };
-    const app = loadPkjs(store, makeWatch(0, 0));
+    const w = makeWatch(0, 0);
+    w.stored = {};
+    const app = loadPkjs(store, w);
 
     app.close({ cmd: 'save', name: 'New', routine: 'New|Squat|3|10|150|0|-' });
-    await app.flush(); await app.flush();
+    await app.settle();
 
     const types = sentEnvelopes(app).map(envelopeType);
     expect(types).toContain('U');
     expect(types).not.toContain('T');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v9.1: a delete is one command, and it must not bounce back.
+//
+// The failure this guards: the page deleted a routine, the phone app removed it
+// from its library and sent 'D', then announced its library with a HELLO whose
+// numbers the watch had never applied — so the watch asked for the library
+// back, and the phone re-sent it from a library that still had the routine. The
+// routine came back on the watch. It now comes back in the dropdown as well if
+// the stale library is ever handed to the page again, which is why none of it
+// may happen.
+// ---------------------------------------------------------------------------
+test.describe('pkjs delete/save, end to end (v9.1)', () => {
+  test('a delete removes the routine on the watch and never re-sends the library', async () => {
+    const store = { savedRoutines: JSON.stringify(['A|Squat|3|5|100|0|-', 'B|Curl|3|12|15|0|-']) };
+    const w = makeWatch(0, 0);
+    w.stored = { A: 'A|Squat|3|5|100|0|-', B: 'B|Curl|3|12|15|0|-' };
+    const app = loadPkjs(store, w);
+
+    app.close({ cmd: 'delete', name: 'A', wasOnPhone: true });
+    await app.settle();
+
+    expect(Object.keys(w.stored)).toEqual(['B']);
+    expect(sentEnvelopes(app).map(envelopeType)).toEqual(['D']);
+    // The HELLO that follows agrees with the watch, so nothing is re-sent.
+    expect(app.ui.sends.filter((m) => m.SYNC_SEQUENCE !== undefined).length).toBeGreaterThan(0);
+    expect(sentEnvelopes(app)).toHaveLength(1);
+  });
+
+  test('a routine this phone does not hold is not deleted on the watch', async () => {
+    // It was deleted ON the watch: the phone app's library has no copy, so a
+    // stale page asking for it to be deleted must reach nothing.
+    const store = { savedRoutines: JSON.stringify(['A|Squat|3|5|100|0|-']) };
+    const w = makeWatch(0, 0);
+    w.stored = { A: 'A|Squat|3|5|100|0|-' };
+    const app = loadPkjs(store, w);
+
+    app.close({ cmd: 'delete', name: 'Gone', wasOnPhone: false });
+    await app.settle();
+
+    expect(sentEnvelopes(app)).toHaveLength(0);
+    expect(Object.keys(w.stored)).toEqual(['A']);
+  });
+
+  test('a save stores the definition, not the progression header', async () => {
+    // The page sends "<name>|<prog>|<inc>|<exercise>|..."; the library and the
+    // watch's 'U' body want six fields per exercise.
+    const store = { savedRoutines: '[]' };
+    const w = makeWatch(0, 0);
+    const app = loadPkjs(store, w);
+
+    app.close({ cmd: 'save', name: 'Push', routine: 'Push|0|2|Bench|3|8|60|0|-' });
+    await app.settle();
+
+    expect(JSON.parse(store.savedRoutines)).toEqual(['Push|Bench|3|8|60|0|-']);
+    expect(envelopeBody(sentEnvelopes(app)[0])).toBe('Push|Bench|3|8|60|0|-');
+    expect(w.stored.Push).toBe('Push|Bench|3|8|60|0|-');
+  });
+
+  test('a save keeps the progression values it was not asked to change', async () => {
+    const store = { savedRoutines: JSON.stringify(['Push|Bench|3|9|62|0|-']) };
+    const w = makeWatch(0, 0);
+    const app = loadPkjs(store, w);
+
+    // Re-saving with an edited note must not lose the progressed targets.
+    app.close({ cmd: 'save', name: 'Push', routine: 'Push|Bench|3|9|62|0|slow' });
+    await app.settle();
+
+    expect(JSON.parse(store.savedRoutines)).toEqual(['Push|Bench|3|9|62|0|slow']);
+    expect(w.stored.Push).toBe('Push|Bench|3|9|62|0|slow');
+  });
+
+  test('a rename leaves one routine on the phone and deletes the old name on the watch', async () => {
+    const store = { savedRoutines: JSON.stringify(['Old|Squat|3|5|100|0|-']) };
+    const w = makeWatch(0, 0);
+    w.stored = { Old: 'Old|Squat|3|5|100|0|-' };
+    const app = loadPkjs(store, w);
+
+    app.close({ cmd: 'save', name: 'New', routine: 'New|Squat|3|5|100|0|-', renamedFrom: 'Old' });
+    await app.settle();
+
+    expect(JSON.parse(store.savedRoutines)).toEqual(['New|Squat|3|5|100|0|-']);
+    expect(Object.keys(w.stored)).toEqual(['New']);
+  });
+
+  test('the library handed to the config page is what the phone holds', async () => {
+    const store = { savedRoutines: JSON.stringify(['A|Squat|3|5|100|0|-', 'B|Curl|3|12|15|0|-']) };
+    const app = loadPkjs(store, makeWatch(0, 0));
+
+    app.listeners.showConfiguration();
+    expect(app.ui.openedUrl).toBeTruthy();
+
+    // The 'sync' param of the URL the config page is opened with.
+    const sync = new URL(app.ui.openedUrl).searchParams.get('sync');
+    const lib = JSON.parse(sync);
+    expect(Object.keys(lib).sort()).toEqual(['A', 'B']);
+    expect(lib.A).toBe('A|Squat|3|5|100|0|-');
   });
 });
 

@@ -383,11 +383,18 @@ let draggedIndex     = null;
 let workoutHistory   = [];
 let shouldClearHistory = false;
 let shouldClearGoogle  = false;
-// Raw routine strings last synced FROM the watch (name → sync string),
-// captured from the 'sync' URL param at page load. Used to detect whether
-// the editor's routine is unchanged, so a mode-only change can be sent
-// without re-transmitting the whole (potentially oversized) routine.
-let syncedRoutinesDict = {};
+// The routines the phone app holds, as it just described them in the 'sync'
+// URL param (name → "<name>|<exercise>|..."). This is a ONE-TIME snapshot of
+// the state at page load, not a live view: the phone app and this page have
+// separate localStorage, so the phone's copy only changes through a close-URL
+// command. Anything deleted here has to be remembered in `deletedHere` or the
+// same snapshot would put it back the next time Settings is opened.
+let phoneRoutines = {};
+
+// Names deleted on this page. `getLibrary()` subtracts them from everything
+// else it knows about, so a delete can never be undone by a stale copy — not
+// this webview's own storage, and not the phone app's snapshot of a moment ago.
+let deletedHere = new Set();
 
 // ============================================================
 // STORAGE HELPERS  (mirrors index.js for consistency)
@@ -478,11 +485,97 @@ function migrateLegacyExercise(ex) {
     return ex;
 }
 
+// ---------------------------------------------------------------------
+// WHICH ROUTINES EXIST HERE
+// ---------------------------------------------------------------------
+// Three sources of truth, and they must be told apart, because the page
+// cannot write the phone app's storage (separate localStorage) and it is
+// handed the same `phoneRoutines` snapshot every time it opens:
+//
+//   1. this page's own `savedRoutines`  — routines this webview has seen
+//   2. `phoneRoutines`                   — what the phone app held when this
+//                                          page was opened ('sync' param)
+//   3. `deletedHere`                     — names deleted on this page
+//
+// The routines that exist are (1 ∪ 2) − 3. The union matters because the
+// webview's storage can be empty (fresh install, cleared webview) while the
+// phone app still holds routines; the subtraction matters because a snapshot
+// taken before a delete must not put the deleted routine back. That is what
+// made a deleted routine reappear in the dropdown the next time Settings was
+// opened: the delete removed it from (1), the phone app from its library, and
+// then this page was handed... its own stale (2).
+function getLibrary() {
+    const routines = [];
+    const seen = new Set();
+
+    for (const r of getSavedRoutines()) {
+        if (!r || !r.name || deletedHere.has(r.name)) continue;
+        if (seen.has(r.name)) continue;
+        seen.add(r.name);
+        routines.push(r);
+    }
+
+    for (const [name, str] of Object.entries(phoneRoutines)) {
+        if (seen.has(name)) continue;
+        const parsed = parseSyncString(str);
+        if (!parsed || parsed.exercises.length === 0) continue;
+        seen.add(name);
+        routines.push({
+            name: name,
+            exercises: parsed.exercises,
+            progressionMode: parsed.progressionMode !== null ? parsed.progressionMode : '-1',
+            weightIncrement: parsed.weightIncrement !== null ? parsed.weightIncrement : '2'
+        });
+    }
+
+    return routines;
+}
+
+// Remove a routine this page deleted, and remember the delete for the rest of
+// this page's life. Both matter: the webview's own localStorage and the phone
+// app's snapshot (taken before the delete) would each put the routine back on
+// their own, so a name deleted here is excluded from getLibrary() whatever
+// happens to those two.
+function forgetRoutine(name) {
+    deletedHere.add(name);
+    Storage.setJSON('savedRoutines', getSavedRoutines().filter(r => r.name !== name));
+    delete phoneRoutines[name];
+    if (getLastRoutine() === name) Storage.remove('lastRoutine');
+}
+
+// Merge a routine that already existed with the one being saved.
+//
+// The webview's localStorage is shared between page loads, so a routine deleted
+// on the watch can leave a copy behind here; the page then shows that copy and
+// the user saves it again. The copy is a starting point, not the truth, so only
+// its progression values (target reps/weight) are carried over — the exercises
+// the user is saving always win, and a name deleted on this page is never
+// resurrected.
+function reconcileWithStoredCopy(routine) {
+    if (!routine || !routine.name || deletedHere.has(routine.name)) return routine;
+    const stored = getSavedRoutines().find(r => r.name === routine.name);
+    if (!stored || !stored.exercises) return routine;
+
+    const merged = (routine.exercises || []).map(migrateLegacyExercise);
+    for (let i = 0; i < merged.length && i < stored.exercises.length; i++) {
+        const old = migrateLegacyExercise((stored.exercises[i] || []).slice());
+        const same = String(old[0]) === String(merged[i][0]) &&
+                     Number(old[1]) === Number(merged[i][1]) &&
+                     Number(old[4]) === Number(merged[i][4]) &&
+                     String(old[5] || '') === String(merged[i][5] || '');
+        if (!same) continue;
+        if (Number(old[2]) > Number(merged[i][2])) merged[i][2] = old[2];
+        if (Number(old[3]) > Number(merged[i][3])) merged[i][3] = old[3];
+    }
+    routine.exercises = merged;
+    return routine;
+}
+
 // ============================================================
 // LOAD SAVED ROUTINES INTO DROPDOWN
 // ============================================================
 function loadSavedRoutines() {
-    const routines   = getSavedRoutines();
+    const routines   = getLibrary();
     const lastRoutine = getLastRoutine();
     const select     = document.getElementById('savedRoutineSelect');
 
@@ -516,7 +609,7 @@ function selectRoutine() {
         updateProgressionUI();
         return;
     }
-    const routine = getSavedRoutines().find(r => r.name === name);
+    const routine = getLibrary().find(r => r.name === name);
     if (!routine) return;
 
     document.getElementById('routineName').value        = routine.name;
@@ -533,9 +626,18 @@ function deleteRoutine() {
     const name = document.getElementById('savedRoutineSelect').value;
     if (!name || !confirm(`Delete '${name}' from saved routines?`)) return;
 
-    let routines = getSavedRoutines().filter(r => r.name !== name);
-    Storage.setJSON('savedRoutines', routines);
-    if (getLastRoutine() === name) Storage.remove('lastRoutine');
+    // Did the routine survive on the phone app? The snapshot says so for every
+    // routine it listed at open; a routine deleted on the watch afterwards is
+    // not in the phone's library any more, so the phone app decides for itself
+    // (it owns that library) and this flag only has to be honest. Nothing here
+    // can delete a routine that the watch deleted.
+    const onPhone = Object.prototype.hasOwnProperty.call(phoneRoutines, name);
+    if (!onPhone) console.warn(`'${name}' is not in the phone app's library; deleting it here locally only`);
+
+    // Remember the delete for the rest of this page's life (forgetRoutine does
+    // that), so neither this webview's own list nor the stale phone snapshot
+    // can bring the routine back.
+    forgetRoutine(name);
 
     loadedRoutineName = '';
 
@@ -547,10 +649,9 @@ function deleteRoutine() {
     updateProgressionUI();
     loadSavedRoutines();
 
-    // Close with a command that deletes the routine by name on the watch too.
-    // This is the one case where a website action removes something from the
-    // watch; a delete made ON the watch does not come back here.
-    const payload = { cmd: 'delete', name: name };
+    // Close with a command that removes the routine from the phone app's
+    // library; the phone app then deletes it on the watch by name.
+    const payload = { cmd: 'delete', name: name, wasOnPhone: onPhone };
     const settings = buildConfigPayload();
     Object.keys(settings).forEach((k) => { payload[k] = settings[k]; });
     sendToPebble(payload);
@@ -1098,12 +1199,22 @@ function buildConfigPayload() {
 //
 // Measured on the device with probe.html: 2000-character payloads arrive
 // intact, so a routine up to MAX_ROUTINE_LEN always fits. No compression.
-function sendRoutineToPebble(name, routineStr) {
+//
+// `name` is what the phone app files it under and what it upserts on the watch
+// — the routine string itself starts with the same name, so the two never
+// disagree. `renameFrom` tells the phone app which name this replaces, so the
+// old one leaves its library too (and the watch deletes it by name).
+function sendRoutineToPebble(name, routineStr, savedStr, renameFrom) {
     const payload = {
         cmd:     'save',
         name:    name,
         routine: routineStr
     };
+    // The library keeps the definition with all six fields per exercise, which
+    // is what `sync` hands back on the next open. Same content, one canonical
+    // spelling.
+    if (savedStr && savedStr !== routineStr) payload.saved = savedStr;
+    if (renameFrom && renameFrom !== name) payload.renamedFrom = renameFrom;
 
     // The close-URL also has to carry the settings the app applies (progression
     // mode, increments, history, credentials), so merge them in.
@@ -1138,6 +1249,50 @@ function sendToPebble(configData) {
 
     window.location.href = returnTo + encoded;
     return true;
+}
+
+// ============================================================
+// ROUTINE DEFINITION STRINGS
+// ============================================================
+// One format for a stored routine, everywhere: "<name>|<exercise>|..." with six
+// fields per exercise. That is exactly what the phone app puts in its library
+// (and upserts to the watch) and exactly what the 'sync' URL param carries, so a
+// name in the dropdown means the same thing in all three places.
+function routineToSyncString(routine) {
+    const exercises = (routine.exercises || []).map(migrateLegacyExercise);
+    let s = routine.name;
+    exercises.forEach(ex => {
+        const mod = ex.length > 4 ? ex[4] : 0;
+        const cmt = (ex.length > 5 && String(ex[5]).trim() !== '') ? String(ex[5]).trim() : '-';
+        s += `|${ex[0]}|${ex[1]}|${ex[2]}|${ex[3]}|${mod}|${cmt}`;
+    });
+    return s;
+}
+
+// "Name|prog|inc|exercise|..." — the routine definition with the progression
+// header the library copy cannot carry (the phone app keeps progression in the
+// settings ints, the dropdown keeps it per routine).
+function routineToFullString(routine) {
+    const header = `${routine.name}|${routine.progressionMode || '-1'}|${routine.weightIncrement || '2'}`;
+    const body = routineToSyncString(routine);
+    const bar = body.indexOf('|');
+    return bar < 0 ? header : header + body.slice(bar);
+}
+
+// What the phone app holds, as a plain object the page can render from:
+//   { 'Push Day': 'Push Day|0|2|Bench Press|3|8|60|0|-', ... }
+// Entries are re-serialised with the progression header (a library entry from
+// an older page holds the definition only, and loses its mode otherwise).
+function phoneRoutineDict(syncedDict) {
+    const out = {};
+    for (const [name, str] of Object.entries(syncedDict || {})) {
+        const parsed = parseSyncString(str);
+        if (!parsed || parsed.exercises.length === 0) continue;
+        out[name] = `${name}|${parsed.progressionMode !== null ? parsed.progressionMode : '-1'}` +
+                    `|${parsed.weightIncrement !== null ? parsed.weightIncrement : '2'}` +
+                    parsed.exercises.map(ex => `|${ex[0]}|${ex[1]}|${ex[2]}|${ex[3]}|${ex[4]}|${ex[5] || '-'}`).join('');
+    }
+    return out;
 }
 
 // Parse a watch sync string ("Name|prog|inc|ex|sets|reps|weight|mod|cmt|...")
@@ -1176,11 +1331,12 @@ function parseSyncString(syncStr) {
 // MANUAL ROUTINE EXPORT  (CSV backup)
 // ============================================================
 function getAllRoutineDefinitions() {
-    const routines = getSavedRoutines();
+    const routines = getLibrary();
     const definitions = {};
 
-    // Every routine currently in savedRoutines is exported: that list IS the
-    // library the watch is given, so the CSV is a faithful backup of it.
+    // Every routine that exists is exported — this webview's own list plus the
+    // phone app's library, minus anything deleted here. That is the same set
+    // the dropdown shows, so the CSV is a faithful backup of it.
     routines.forEach(r => {
         const parts = [r.name, r.progressionMode || '-1', r.weightIncrement || '2'];
         (r.exercises || []).forEach(ex => {
@@ -1275,12 +1431,24 @@ function saveAndSendSingle() {
             document.getElementById('weightIncrement').value,
             renameFrom);
         loadedRoutineName = name;   // the new name is the baseline from now on
+
+        // Saving this name again brings it back: it is no longer deleted, and a
+        // rename leaves the old name behind nowhere but the watch, which the
+        // phone app deletes by name. (forgetRoutine records the old name as
+        // deleted here, so it cannot reappear in the dropdown afterwards.)
+        deletedHere.delete(name);
+        if (renameFrom) forgetRoutine(renameFrom);
         loadSavedRoutines();
 
         // Send THIS routine only. The watch upserts by name: an existing name
         // has its exercises replaced, a new one is added, and every other
         // routine on the watch is left untouched.
-        const sent = sendRoutineToPebble(name, routineStr);
+        //
+        // `routine` and `routineStr` are the same definition; the phone app
+        // keeps one of them verbatim in its library and sends it to the watch,
+        // so the copy that survives a page reload is the one with the name and
+        // all six fields per exercise — exactly what `sync` hands back.
+        const sent = sendRoutineToPebble(name, routineStr, routineStr, renameFrom);
         if (!sent) return;          // sendToPebble already explained why
     }
 
@@ -1573,7 +1741,6 @@ window.addEventListener('load', () => {
     renderExerciseDropdown();
     updateModifierDesc();
     updateProgressionUI();
-    loadSavedRoutines();
 
     // Beta diagnostic (?diag=1): replaces the builder with the close-URL size
     // probe. Returns early from nothing — it only toggles visibility, so normal
@@ -1594,117 +1761,114 @@ window.addEventListener('load', () => {
     catch { workoutHistory = []; }
     renderHistory();
 
-    // Auto-load progressed routine from watch sync, if available.
-    // FIX: synced_routines may be stale (it is only updated when the watch
-    // sends a workout-complete appmessage, not when the user edits a routine
-    // and sends it back). Blindly overwriting the local copy on every page
-    // open caused the user's freshly-edited routine to be silently replaced
-    // by an older version from the watch. The local copy is now treated as
-    // authoritative; sync data is only allowed to fill in progressed
-    // target_weight values for exercises the user has not modified.
-    try {
-        const syncParam = getQueryParam('sync', '{}');
-        syncedRoutinesDict = JSON.parse(syncParam);
+    // The phone app's library, as it was when it opened this page.
+    //
+    // It is captured BEFORE anything is loaded or imported, and only ever added
+    // to by a save (and removed from by a delete). Every routine listed here
+    // is on the phone and on the watch, so importing it into this webview's
+    // storage is bookkeeping — it does not send anything anywhere.
+    loadPhoneLibrary(getQueryParam('sync', '{}'));
+    loadSavedRoutines();
 
-        // FIX (empty routine list on first open): the page's localStorage can
-        // be empty (fresh phone, cleared webview) while the watch still knows
-        // every routine — it passes them in via the 'sync' URL param. The old
-        // code only consulted sync data for the currently selected routine,
-        // which is none on a fresh page, so the "Saved on Phone" list stayed
-        // empty. Seed any synced routine that has no local copy yet; existing
-        // local copies stay authoritative.
-        const localNames = new Set(getSavedRoutines().map(r => r.name));
-        const lastBeforeSeed = getLastRoutine();
-        let seeded = false;
-        for (const [syncName, syncRoutineStr] of Object.entries(syncedRoutinesDict)) {
-            if (localNames.has(syncName)) continue;
-            const parsedSync = parseSyncString(syncRoutineStr);
-            if (!parsedSync || parsedSync.exercises.length === 0) continue;
-            saveRoutineToStorage(syncName, parsedSync.exercises,
-                parsedSync.progressionMode !== null ? parsedSync.progressionMode : '-1',
-                parsedSync.weightIncrement !== null ? parsedSync.weightIncrement : '2');
-            seeded = true;
-        }
-        if (seeded) {
-            // saveRoutineToStorage moves lastRoutine — restore the user's
-            // previous selection if they had one, then refresh the dropdown.
-            if (lastBeforeSeed) Storage.set('lastRoutine', lastBeforeSeed);
-            loadSavedRoutines();
-        }
-
-        const syncedDict = syncedRoutinesDict;
-        const activeName = document.getElementById('routineName').value;
-        const syncStr = syncedDict[activeName];
-        if (!syncStr) return;
-
-        const parsed = parseSyncString(syncStr);
-        if (!parsed) return;
-        const syncExercises        = parsed.exercises;
-        const syncProgressionMode  = parsed.progressionMode;
-        const syncWeightIncrement  = parsed.weightIncrement;
-
-        const localRoutine = getSavedRoutines().find(r => r.name === activeName);
-        if (!localRoutine) {
-            // First-time import: no local copy exists yet, use the sync
-            // string as-is (preserves the original import behaviour).
-            if (syncProgressionMode !== null) {
-                document.getElementById('progressionMode').value = syncProgressionMode;
-                document.getElementById('weightIncrement').value = syncWeightIncrement;
-                updateProgressionUI();
-            }
-            myRoutine = syncExercises;
-            loadedRoutineName = activeName;   // baseline for rename detection
-            renderRoutine();
-            saveRoutineToStorage(
-                activeName,
-                myRoutine,
-                document.getElementById('progressionMode').value,
-                document.getElementById('weightIncrement').value
-            );
-            return;
-        }
-
-        // Local copy exists: overlay ONLY the progression values.
-        // v7.0.0: the phone is the single source of truth for routine
-        // definitions, so the watch can no longer add, rename, reorder or
-        // remove exercises. The only thing it still reports is auto-progression
-        // of target reps/weight, which is merged here by exercise identity
-        // (name, sets, modifier, comment). Anything extra the watch reports is
-        // ignored — that eliminates the resurrection/duplication bugs (#46).
-        let merged = false;
-        const mergedExercises = (localRoutine.exercises || []).map(migrateLegacyExercise);
-        for (let i = 0; i < syncExercises.length && i < mergedExercises.length; i++) {
-            const local = mergedExercises[i];
-            const syncEx = syncExercises[i];
-            const sameExercise =
-                String(local[0]) === String(syncEx[0]) &&
-                Number(local[1]) === Number(syncEx[1]) &&
-                Number(local[4]) === Number(syncEx[4]) &&
-                String(local[5] || '') === String(syncEx[5] || '');
-            if (sameExercise) {
-                if (Number(local[2]) !== Number(syncEx[2])) {
-                    local[2] = Number(syncEx[2]);
-                    merged = true;
-                }
-                if (Number(local[3]) !== Number(syncEx[3])) {
-                    local[3] = Number(syncEx[3]);
-                    merged = true;
-                }
-            }
-        }
-
-        if (merged) {
-            myRoutine = mergedExercises;
-            renderRoutine();
-            saveRoutineToStorage(
-                activeName,
-                myRoutine,
-                document.getElementById('progressionMode').value,
-                document.getElementById('weightIncrement').value
-            );
-        }
-    } catch {}
+    // Progression targets the watch has moved on to, merged into the routine
+    // that is now in the editor.
+    mergeProgressionTargets();
 });
+
+// Take the phone app's library from the 'sync' URL param.
+//
+// The webview and the phone app have separate localStorage, so this is the
+// only way the page learns what the phone holds; it is a snapshot, not a live
+// view. It is used to (a) list the routines the phone has, (b) recognise a
+// routine the phone does not have yet, so the library gets a copy, and
+// (c) know, when deleting, whether the phone app has anything to delete.
+//
+// FIX (deleted routine came back in the dropdown): the library is NOT merged
+// into `savedRoutines` by absence-implies-delete any more. The old seeding step
+// re-created any routine the webview's storage did not have — which is exactly
+// what a routine deleted a minute ago looks like, because the phone app opened
+// the page with the snapshot it took before the delete. Importing is still
+// needed (the webview's storage can be empty while the phone has routines), so
+// it is done once per page load, and a name deleted here is never imported.
+function loadPhoneLibrary(syncParam) {
+    try {
+        phoneRoutines = phoneRoutineDict(JSON.parse(syncParam || '{}'));
+    } catch {
+        phoneRoutines = {};
+    }
+
+    const localNames = new Set(getSavedRoutines().map(r => r.name));
+    const lastBeforeSeed = getLastRoutine();
+    let seeded = false;
+
+    for (const [name, str] of Object.entries(phoneRoutines)) {
+        if (localNames.has(name) || deletedHere.has(name)) continue;
+        const parsed = parseSyncString(str);
+        if (!parsed || parsed.exercises.length === 0) continue;
+        // A copy this webview kept from before the phone's delete: reconcile it
+        // with what the phone app holds rather than resurrecting it verbatim.
+        const routine = reconcileWithStoredCopy({
+            name: name,
+            exercises: parsed.exercises,
+            progressionMode: parsed.progressionMode,
+            weightIncrement: parsed.weightIncrement
+        });
+        saveRoutineToStorage(name, routine.exercises,
+            routine.progressionMode !== null ? routine.progressionMode : '-1',
+            routine.weightIncrement !== null ? routine.weightIncrement : '2');
+        seeded = true;
+    }
+    // saveRoutineToStorage moves lastRoutine; restore the user's previous
+    // selection so the dropdown still opens on what they last used.
+    if (seeded && lastBeforeSeed) Storage.set('lastRoutine', lastBeforeSeed);
+}
+
+// Merge auto-progression into the routine in the editor.
+//
+// v7.0.0: the phone is the single source of truth for routine definitions, so
+// the watch can no longer add, rename, reorder or remove exercises. The only
+// thing it still reports is progression of target reps/weight, and that is
+// merged by exercise identity (name, sets, modifier, comment); anything extra
+// is ignored, which is what stopped the resurrection/duplication bugs (#46) and
+// is why deleting on the watch cannot bring a routine back here.
+function mergeProgressionTargets() {
+    const activeName = document.getElementById('routineName').value;
+    const syncStr = phoneRoutines[activeName];
+    if (!syncStr) return;
+
+    const parsed = parseSyncString(syncStr);
+    if (!parsed || parsed.exercises.length === 0) return;
+
+    const localRoutine = getSavedRoutines().find(r => r.name === activeName);
+    if (!localRoutine) return;   // not in this webview's storage: the import did it
+
+    let merged = false;
+    const mergedExercises = (localRoutine.exercises || []).map(migrateLegacyExercise);
+    for (let i = 0; i < parsed.exercises.length && i < mergedExercises.length; i++) {
+        const local = mergedExercises[i];
+        const syncEx = parsed.exercises[i];
+        const sameExercise =
+            String(local[0]) === String(syncEx[0]) &&
+            Number(local[1]) === Number(syncEx[1]) &&
+            Number(local[4]) === Number(syncEx[4]) &&
+            String(local[5] || '') === String(syncEx[5] || '');
+        if (!sameExercise) continue;
+
+        if (Number(local[2]) !== Number(syncEx[2])) { local[2] = Number(syncEx[2]); merged = true; }
+        if (Number(local[3]) !== Number(syncEx[3])) { local[3] = Number(syncEx[3]); merged = true; }
+    }
+
+    if (!merged) return;
+    myRoutine = mergedExercises;
+    renderRoutine();
+    saveRoutineToStorage(
+        activeName,
+        myRoutine,
+        document.getElementById('progressionMode').value,
+        document.getElementById('weightIncrement').value
+    );
+}
+
 // ============================================================
 // CLOSE-URL SIZE PROBE  (beta diagnostic, only with ?diag=1)
 // ============================================================

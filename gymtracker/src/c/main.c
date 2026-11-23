@@ -11,7 +11,7 @@
 // Shown in the Settings window header so the build on the wrist is obvious at a
 // glance (useful when testing a sideloaded build or an App Store update).
 // MUST match "version" in package.json -- tests/test-version.js checks it.
-#define APP_VERSION "7.1.0"
+#define APP_VERSION "7.1.1"
 
 #define STORAGE_KEY_BASE   100
 #define SETTINGS_KEY_BASE  200
